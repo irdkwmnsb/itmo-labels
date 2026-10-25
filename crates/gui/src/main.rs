@@ -62,10 +62,19 @@ fn main() {
             .get_element_by_id("app")
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .expect("index.html has a canvas#app");
+        // Taps keep their default action: Android Chrome opens the keyboard on a tap that ends
+        // on a focused text field, and a prevented touchstart or touchend is no tap. Scrolling
+        // and zooming the page are off in index.html instead.
+        let options = eframe::WebOptions {
+            should_prevent_default: Box::new(|event| {
+                !matches!(event, egui::Event::PointerButton { .. } | egui::Event::PointerGone)
+            }),
+            ..Default::default()
+        };
         let started = eframe::WebRunner::new()
             .start(
                 canvas,
-                eframe::WebOptions::default(),
+                options,
                 Box::new(|cc| {
                     install_fonts(&cc.egui_ctx);
                     Ok(Box::new(app::App::new(&cc.egui_ctx)))
