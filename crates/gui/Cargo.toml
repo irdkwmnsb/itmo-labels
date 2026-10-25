@@ -1,0 +1,12 @@
+[package]
+name = "itmo-labels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "wayland", "x11"] }
+itmo-labels-core.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+sys-locale = "0.3.2"
+toml = "1.1.8"

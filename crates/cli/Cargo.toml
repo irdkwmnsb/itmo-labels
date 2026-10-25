@@ -1,0 +1,11 @@
+[package]
+name = "itmo-labels-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "labelprobe"
+path = "src/main.rs"
+
+[dependencies]
+itmo-labels-core.workspace = true
