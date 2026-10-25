@@ -1,13 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::{path::Path, process::Command};
 
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, RichText, Stroke, TextEdit,
     TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand,
 };
+use web_time::{Duration, Instant};
 use itmo_labels_core::{
     fonts,
     label::Bitmap,
@@ -16,14 +13,16 @@ use itmo_labels_core::{
 };
 
 use crate::{
-    config::{self, Lang, Orientation, Size, State, Template, WatchedFile},
+    config::{self, Lang, Orientation, Size, Source, State, Template},
     editor::{self, Editor},
     i18n::{Tr, tr},
-    printer::{Health, Snapshot, Worker},
+    printer::{Health, Printers, Snapshot},
 };
 
 pub const DPI: u32 = 203;
 const SAVE_DELAY: Duration = Duration::from_secs(1);
+/// Narrower than this, the preview goes under the controls instead of beside them.
+const NARROW: f32 = 700.0;
 
 pub struct Fonts {
     regular: fonts::Font<'static>,
@@ -98,12 +97,12 @@ pub fn paint_label(ui: &Ui, area: egui::Rect, texture: &TextureHandle, size_px: 
 /// A user-editable list that keeps its last valid contents while the file is broken.
 struct Watched<T> {
     items: Vec<T>,
-    file: Option<WatchedFile<Vec<T>>>,
+    file: Option<Source<Vec<T>>>,
     error: Option<String>,
 }
 
 impl<T> Watched<T> {
-    fn new(builtin: Vec<T>, file: std::io::Result<WatchedFile<Vec<T>>>) -> Self {
+    fn new(builtin: Vec<T>, file: std::io::Result<Source<Vec<T>>>) -> Self {
         match file {
             Ok(file) => Self { items: builtin, file: Some(file), error: None },
             Err(e) => Self { items: builtin, file: None, error: Some(e.to_string()) },
@@ -111,7 +110,7 @@ impl<T> Watched<T> {
     }
 
     fn poll(&mut self) {
-        match self.file.as_mut().and_then(WatchedFile::poll) {
+        match self.file.as_mut().and_then(Source::poll) {
             Some(Ok(items)) => {
                 self.items = items;
                 self.error = None;
@@ -121,47 +120,69 @@ impl<T> Watched<T> {
         }
     }
 
+    /// Where to open the file in a text editor; never in the web build.
     fn path(&self) -> Option<&Path> {
-        self.file.as_ref().map(|f| f.path.as_path())
+        self.file.as_ref().and_then(Source::path)
     }
 }
 
 pub struct App {
-    dir: PathBuf,
     state: State,
     saved: State,
     changed_at: Instant,
     sizes: Watched<Size>,
     templates: Watched<Template>,
-    worker: Worker,
+    printers: Printers,
     snapshot: Snapshot,
     rendered: Option<(RenderKey, Rendered, TextureHandle)>,
     fonts: Fonts,
     editor: Editor,
-    #[cfg(debug_assertions)]
+    #[cfg(not(target_arch = "wasm32"))]
+    serving: crate::serving::Serving,
+    #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
     screenshot: crate::debug::Screenshot,
 }
 
 impl App {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(ctx: &egui::Context) -> Self {
         let dir = config::dir();
-        let state = State::load(&dir);
+        let state = State::load();
         let wake = ctx.clone();
-        let worker = Worker::spawn(state.printer.clone(), move || wake.request_repaint());
+        let service = crate::printer::Service::spawn(move || wake.request_repaint());
+        let wake = ctx.clone();
+        let printers = Printers::new(service.clone(), state.printer.clone(), move || wake.request_repaint());
         Self {
             sizes: Watched::new(config::builtin_sizes(), config::sizes_file(&dir)),
             templates: Watched::new(config::builtin_templates(), config::templates_file(&dir)),
-            dir,
+            serving: crate::serving::Serving::new(service, &state),
             saved: state.clone(),
             state,
             changed_at: Instant::now(),
-            worker,
+            printers,
             snapshot: Snapshot::default(),
             rendered: None,
             fonts: Fonts::embedded(),
             editor: Editor::default(),
             #[cfg(debug_assertions)]
             screenshot: crate::debug::Screenshot::from_env(),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(ctx: &egui::Context) -> Self {
+        let state = State::load();
+        Self {
+            sizes: Watched::new(config::builtin_sizes(), crate::web::sizes_file(ctx)),
+            templates: Watched::new(config::builtin_templates(), crate::web::templates_file(ctx)),
+            printers: Printers::new(ctx, state.printer.clone()),
+            saved: state.clone(),
+            state,
+            changed_at: Instant::now(),
+            snapshot: Snapshot::default(),
+            rendered: None,
+            fonts: Fonts::embedded(),
+            editor: Editor::default(),
         }
     }
 
@@ -230,7 +251,7 @@ impl App {
     fn save_state_if_settled(&mut self) {
         if self.state != self.saved {
             if self.changed_at.elapsed() >= SAVE_DELAY {
-                let _ = self.state.save(&self.dir);
+                let _ = self.state.save();
                 self.saved = self.state.clone();
             }
         } else {
@@ -246,7 +267,8 @@ impl App {
         let template = self.selected_template().map(|t| t.name.clone()).unwrap_or_default();
         let orientation = self.selected_template().map(|t| self.orientation(t)).unwrap_or_default();
         let size = self.selected_size().map(Size::title).unwrap_or_default();
-        self.editor.open(&self.templates.items, self.templates.path(), &template, &size, orientation);
+        let writer = self.templates.file.as_ref().map(Source::<Vec<Template>>::writer);
+        self.editor.open(&self.templates.items, writer, &template, &size, orientation);
     }
 
     fn controls(&mut self, ui: &mut Ui, t: &Tr) {
@@ -277,7 +299,7 @@ impl App {
             for name in &printers {
                 if ui.selectable_label(current.as_deref() == Some(name), name).clicked() {
                     self.state.printer = Some(name.clone());
-                    self.worker.select(Some(name.clone()));
+                    self.printers.select(Some(name.clone()));
                 }
             }
         });
@@ -288,7 +310,8 @@ impl App {
 
         let selected = self.selected_size().map(Size::title).unwrap_or_default();
         let titles: Vec<String> = self.sizes.items.iter().map(Size::title).collect();
-        let (choice, edit) = list_picker(ui, "size", t.size, t.edit_sizes, self.sizes.path(), &selected, &titles);
+        let (choice, edit) =
+            list_picker(ui, "size", t.size, t.edit_sizes, self.sizes.path().is_some(), &selected, &titles);
         if let Some(choice) = choice {
             self.state.size = Some(choice);
         }
@@ -303,8 +326,8 @@ impl App {
         let template = self.selected_template().cloned();
         let names: Vec<String> = self.template_list().iter().map(|t| t.name.clone()).collect();
         let shown = template.as_ref().map_or(t.no_templates, |t| t.name.as_str());
-        let (choice, edit) =
-            list_picker(ui, "template", t.template, t.edit_templates, self.templates.path(), shown, &names);
+        let editable = self.templates.file.is_some();
+        let (choice, edit) = list_picker(ui, "template", t.template, t.edit_templates, editable, shown, &names);
         if let Some(choice) = choice {
             self.state.template = Some(choice);
         }
@@ -359,7 +382,7 @@ impl App {
             && let Some((_, r, _)) = &self.rendered
             && let Ok(job) = (Tspl { dpi: DPI }).encode(&r.label, 1)
         {
-            self.worker.print(job);
+            self.printers.print(job);
         }
         match &self.snapshot.last_job {
             Some(Ok(())) => {
@@ -372,25 +395,52 @@ impl App {
         }
     }
 
-    fn preview(&self, ui: &mut Ui) {
+    /// Fills `area`, or with `None` the rest of the panel.
+    fn preview(&self, ui: &mut Ui, area: Option<egui::Rect>) {
         let Some((_, r, texture)) = &self.rendered else { return };
         let size = Vec2::new(r.preview.width_px as f32, r.preview.height_px as f32);
-        paint_label(ui, ui.available_rect_before_wrap(), texture, size);
+        paint_label(ui, area.unwrap_or_else(|| ui.available_rect_before_wrap()), texture, size);
+    }
+
+    /// One column: the controls, then the preview as tall as the label needs.
+    fn narrow_layout(&mut self, ui: &mut Ui, t: &Tr) {
+        CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(8.0);
+                self.side_panel(ui, t);
+                ui.add_space(12.0);
+                if let Some((_, r, _)) = &self.rendered {
+                    let w = ui.available_width();
+                    let h = (w * r.preview.height_px as f32 / r.preview.width_px as f32 + 48.0).clamp(160.0, 560.0);
+                    let (area, _) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
+                    self.preview(ui, Some(area));
+                }
+            });
+        });
+    }
+
+    fn side_panel(&mut self, ui: &mut Ui, t: &Tr) {
+        self.controls(ui, t);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.serving.controls(ui, t, &mut self.state);
     }
 
     /// Called from `logic`, not `ui`: eframe skips `ui` while every window is covered
     /// (e.g. after Cmd+Tab), and a viewport left out of a frame gets destroyed, together
     /// with the GL surface glow may still have current, which panics on the next paint.
+    #[cfg(not(target_arch = "wasm32"))]
     fn show_editor(&mut self, ctx: &egui::Context) {
         let t = tr(self.lang());
-        let Self { editor, fonts, sizes, .. } = self;
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("{} — ITMO Labels", t.editor_title))
             .with_inner_size([1100.0, 680.0])
             .with_min_inner_size([820.0, 500.0]);
-        let outcome = ctx.show_viewport_immediate(editor::viewport_id(), builder, |ui, _| {
-            editor.show(ui, t, fonts, &sizes.items)
-        });
+        ctx.clone().show_viewport_immediate(editor::viewport_id(), builder, |ui, _| self.editor_frame(ui));
+    }
+
+    fn editor_frame(&mut self, ui: &mut Ui) {
+        let t = tr(self.lang());
+        let outcome = self.editor.show(ui, t, &self.fonts, &self.sizes.items);
         for (old, new) in outcome.renames {
             if self.state.template.as_ref() == Some(&old) {
                 self.state.template = Some(new);
@@ -409,14 +459,14 @@ fn list_picker(
     id: &str,
     heading: &str,
     edit: &str,
-    file: Option<&Path>,
+    editable: bool,
     selected: &str,
     items: &[String],
 ) -> (Option<String>, bool) {
     let mut edit_clicked = false;
     ui.horizontal(|ui| {
         ui.label(heading);
-        if file.is_some() {
+        if editable {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 edit_clicked = ui.small_button(edit).clicked();
             });
@@ -467,13 +517,15 @@ fn status_line(ui: &mut Ui, t: &Tr, s: &Snapshot) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.snapshot = self.worker.snapshot();
+        self.snapshot = self.printers.snapshot();
         if self.state.printer.is_none()
             && let Some(first) = self.snapshot.printers.first()
         {
             self.state.printer = Some(first.clone());
-            self.worker.select(Some(first.clone()));
+            self.printers.select(Some(first.clone()));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.serving.sync(&mut self.state);
         self.sizes.poll();
         self.templates.poll();
         // An unsaved draft wins over edits to the file; without one the editor follows the file.
@@ -484,12 +536,13 @@ impl eframe::App for App {
             self.editor.ask_before_quitting();
         }
         // glow cannot screenshot a separate window, so the editor is drawn inside the main one.
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         if self.screenshot.wants_editor() && !self.editor.is_open() {
             ctx.set_embed_viewports(true);
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(1400.0, 860.0)));
             self.open_editor(ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.editor.is_open() {
             self.show_editor(ctx);
         }
@@ -497,20 +550,29 @@ impl eframe::App for App {
         self.save_state_if_settled();
         // Keep polling the config files and flushing state even when nothing else repaints.
         ctx.request_repaint_after(Duration::from_secs(1));
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         self.screenshot.tick(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let t = tr(self.lang());
+        // A web page has no second window: the editor takes the whole page instead.
+        if cfg!(target_arch = "wasm32") && self.editor.is_open() {
+            self.editor_frame(ui);
+            return;
+        }
+        if ui.available_width() < NARROW {
+            self.narrow_layout(ui, t);
+            return;
+        }
         Panel::left("controls").exact_size(320.0).show(ui, |ui| {
             ui.add_space(8.0);
-            egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, t));
+            egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui, t));
         });
-        CentralPanel::default().show(ui, |ui| self.preview(ui));
+        CentralPanel::default().show(ui, |ui| self.preview(ui, None));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.state.save(&self.dir);
+        let _ = self.state.save();
     }
 }

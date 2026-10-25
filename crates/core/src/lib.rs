@@ -5,5 +5,7 @@
 pub mod fonts;
 pub mod label;
 pub mod render;
+// USB needs an OS; the web build renders and encodes only.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 pub mod tspl;

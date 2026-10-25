@@ -3,9 +3,13 @@
 //! - `sizes.toml`, `templates.toml`: seeded from the built-in versions on first run,
 //!   edited by the user, re-read whenever they change;
 //! - `state.toml`: the last session, written by the app.
+//!
+//! The web build has no files of its own: it reads and writes the server's sizes and
+//! templates over HTTP (see `web`) and keeps its state in the browser's local storage.
 
+use std::collections::{BTreeMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
-    collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
@@ -105,11 +109,13 @@ orientation = "landscape"
   h = 0.14
 "#;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("itmo-labels")
 }
 
 /// A user-editable TOML file, seeded with a default and polled for changes by modification time.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct WatchedFile<T> {
     pub path: PathBuf,
     parse: fn(&str) -> Result<T, String>,
@@ -117,6 +123,7 @@ pub struct WatchedFile<T> {
     checked: Instant,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T> WatchedFile<T> {
     const POLL: Duration = Duration::from_secs(1);
 
@@ -141,6 +148,46 @@ impl<T> WatchedFile<T> {
         }
         self.modified = modified;
         Some(fs::read_to_string(&self.path).map_err(|e| e.to_string()).and_then(|text| (self.parse)(&text)))
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+}
+
+/// A config file as the app sees it: on disk here, on the server in the web build.
+#[cfg(not(target_arch = "wasm32"))]
+pub type Source<T> = WatchedFile<T>;
+#[cfg(target_arch = "wasm32")]
+pub type Source<T> = crate::web::RemoteFile<T>;
+#[cfg(target_arch = "wasm32")]
+pub use crate::web::TemplatesWriter;
+
+/// Where the template editor saves.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TemplatesWriter(pub PathBuf);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TemplatesWriter {
+    /// Replaces the whole file; the header with the format description is written anew.
+    pub fn write(&self, templates: &[Template]) -> Result<(), String> {
+        write_templates(&self.0, templates)
+    }
+
+    /// A save that failed after `write` returned; never happens with a local file.
+    pub fn failed(&self) -> Option<String> {
+        None
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WatchedFile<Vec<Template>> {
+    pub fn writer(&self) -> TemplatesWriter {
+        TemplatesWriter(self.path.clone())
     }
 }
 
@@ -168,7 +215,7 @@ struct SizesFile {
     sizes: Vec<Size>,
 }
 
-fn parse_sizes(text: &str) -> Result<Vec<Size>, String> {
+pub fn parse_sizes(text: &str) -> Result<Vec<Size>, String> {
     let file: SizesFile = toml::from_str(text).map_err(|e| e.to_string())?;
     if file.sizes.is_empty() {
         return Err("no [[size]] entries".into());
@@ -179,6 +226,7 @@ fn parse_sizes(text: &str) -> Result<Vec<Size>, String> {
     Ok(file.sizes)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn sizes_file(dir: &Path) -> io::Result<WatchedFile<Vec<Size>>> {
     WatchedFile::open(dir, "sizes.toml", DEFAULT_SIZES, parse_sizes)
 }
@@ -358,23 +406,25 @@ fn validate_templates(templates: &[Template]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_templates(text: &str) -> Result<Vec<Template>, String> {
+pub fn parse_templates(text: &str) -> Result<Vec<Template>, String> {
     let file: TemplatesFile = toml::from_str(text).map_err(|e| e.to_string())?;
     validate_templates(&file.templates)?;
     Ok(file.templates)
 }
 
-fn format_templates(templates: &[Template]) -> Result<String, String> {
+pub fn format_templates(templates: &[Template]) -> Result<String, String> {
     validate_templates(templates)?;
     let body = toml::to_string(&TemplatesFile { templates: templates.to_vec() }).map_err(|e| e.to_string())?;
     Ok(format!("{TEMPLATES_HEADER}\n{body}"))
 }
 
 /// Replaces the whole file; the header with the format description is written anew.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_templates(path: &Path, templates: &[Template]) -> Result<(), String> {
     fs::write(path, format_templates(templates)?).map_err(|e| e.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn templates_file(dir: &Path) -> io::Result<WatchedFile<Vec<Template>>> {
     WatchedFile::open(dir, "templates.toml", &format!("{TEMPLATES_HEADER}\n{DEFAULT_TEMPLATES}"), parse_templates)
 }
@@ -419,22 +469,52 @@ pub struct State {
     pub lang: Option<Lang>,
     /// Template name → its last texts and orientation.
     pub templates: BTreeMap<String, TemplateState>,
+    /// Serve the app to the local network.
+    pub server: bool,
+    /// `None` for `DEFAULT_PORT`.
+    pub port: Option<u16>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_PORT: u16 = 8080;
+
 impl State {
-    fn path(dir: &Path) -> PathBuf {
-        dir.join("state.toml")
-    }
-
     /// Missing or unreadable state is not an error: start fresh.
-    pub fn load(dir: &Path) -> Self {
-        fs::read_to_string(Self::path(dir)).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+    fn parse(text: Option<String>) -> Self {
+        text.and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
     }
 
-    pub fn save(&self, dir: &Path) -> io::Result<()> {
-        fs::create_dir_all(dir)?;
-        let text = toml::to_string(self).map_err(io::Error::other)?;
-        fs::write(Self::path(dir), text)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn path() -> PathBuf {
+        dir().join("state.toml")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load() -> Self {
+        Self::parse(fs::read_to_string(Self::path()).ok())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save(&self) -> Result<(), String> {
+        let text = toml::to_string(self).map_err(|e| e.to_string())?;
+        fs::create_dir_all(dir()).and_then(|()| fs::write(Self::path(), text)).map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load() -> Self {
+        Self::parse(crate::web::local_storage().and_then(|s| s.get_item(crate::web::STATE_KEY).ok().flatten()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn save(&self) -> Result<(), String> {
+        let text = toml::to_string(self).map_err(|e| e.to_string())?;
+        let storage = crate::web::local_storage().ok_or("no local storage")?;
+        storage.set_item(crate::web::STATE_KEY, &text).map_err(|e| format!("{e:?}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_PORT)
     }
 }
 
@@ -507,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_templates_are_not_written() {
+    fn invalid_templates_are_not_formatted() {
         let mut templates = builtin_templates();
         templates[1].name = templates[0].name.clone();
         assert!(format_templates(&templates).is_err());

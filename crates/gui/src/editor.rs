@@ -1,11 +1,7 @@
 //! Template editor: a window of its own that edits a draft of the whole `templates.toml`.
 //! The main window renders the draft as it changes; the file is only written on Save.
 
-use std::{
-    collections::HashMap,
-    mem,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, mem};
 
 use eframe::egui::{
     self, Align2, Button, CentralPanel, Color32, ComboBox, CursorIcon, DragValue, FontId, Grid, Id, Key,
@@ -16,7 +12,7 @@ use itmo_labels_core::render::{MARGIN_MM, Rendered};
 
 use crate::{
     app::{self, DPI, Fonts, RenderKey},
-    config::{self, Field, FieldAlign, FieldFit, Orientation, Size, Template},
+    config::{Field, FieldAlign, FieldFit, Orientation, Size, Template, TemplatesWriter},
     i18n::Tr,
 };
 
@@ -271,10 +267,12 @@ pub struct Outcome {
 #[derive(Default)]
 pub struct Editor {
     open: bool,
-    path: Option<PathBuf>,
+    writer: Option<TemplatesWriter>,
     draft: Vec<Entry>,
     /// What the file holds.
     baseline: Vec<Entry>,
+    /// The baseline before the last save, until the server confirms it (web only).
+    before_save: Option<Vec<Entry>>,
     /// The draft as of the last undo step.
     committed: Vec<Entry>,
     undo: Vec<Vec<Entry>>,
@@ -295,6 +293,8 @@ pub struct Editor {
     live_ids: Vec<u64>,
     /// An input box had focus at the end of the last frame: its Esc must not reach the canvas.
     typing: bool,
+    /// The web page has no window frame to close the editor with, so it gets a button.
+    close_clicked: bool,
 }
 
 impl Editor {
@@ -310,9 +310,9 @@ impl Editor {
         !self.draft.iter().map(|e| &e.template).eq(self.baseline.iter().map(|e| &e.template))
     }
 
-    pub fn open(&mut self, templates: &[Template], path: Option<&Path>, template: &str, size: &str, orientation: Orientation) {
+    pub fn open(&mut self, templates: &[Template], writer: Option<TemplatesWriter>, template: &str, size: &str, orientation: Orientation) {
         self.open = true;
-        self.path = path.map(Path::to_path_buf);
+        self.writer = writer;
         self.size = size.to_owned();
         self.orientation = orientation;
         self.reset(templates);
@@ -324,6 +324,7 @@ impl Editor {
         let selected = self.current().map(|i| self.draft[i].template.name.clone());
         self.draft = templates.iter().map(|t| self.entry(t.clone())).collect();
         self.baseline = self.draft.clone();
+        self.before_save = None;
         self.committed = self.draft.clone();
         self.undo.clear();
         self.redo.clear();
@@ -369,15 +370,15 @@ impl Editor {
     }
 
     fn can_save(&self) -> bool {
-        self.path.is_some() && Problems::of(&self.draft).is_empty()
+        self.writer.is_some() && Problems::of(&self.draft).is_empty()
     }
 
     fn save(&mut self) -> Option<Vec<Template>> {
-        let path = self.path.as_ref()?;
+        let writer = self.writer.as_ref()?;
         let templates: Vec<Template> = self.draft.iter().map(|e| e.template.clone()).collect();
-        match config::write_templates(path, &templates) {
+        match writer.write(&templates) {
             Ok(()) => {
-                self.baseline = self.draft.clone();
+                self.before_save = Some(mem::replace(&mut self.baseline, self.draft.clone()));
                 self.save_error = None;
                 Some(templates)
             }
@@ -493,7 +494,14 @@ impl Editor {
     pub fn show(&mut self, ui: &mut Ui, t: &Tr, fonts: &Fonts, sizes: &[Size]) -> Outcome {
         let ctx = ui.ctx().clone();
         let before: Vec<(u64, String)> = self.live_ids.iter().copied().zip(self.live.iter().map(|t| t.name.clone())).collect();
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // The server turned down a save `write` had accepted: the draft is unsaved again.
+        if let Some(e) = self.writer.as_ref().and_then(TemplatesWriter::failed) {
+            if let Some(baseline) = self.before_save.take() {
+                self.baseline = baseline;
+            }
+            self.save_error = Some(e);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) || mem::take(&mut self.close_clicked) {
             if self.dirty() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.closing.get_or_insert(false);
@@ -549,14 +557,17 @@ impl Editor {
                 self.step_forward();
             }
             ui.separator();
-            if self.path.is_none() {
+            if cfg!(target_arch = "wasm32") && ui.button(t.close).clicked() {
+                self.close_clicked = true;
+            }
+            if self.writer.is_none() {
                 ui.colored_label(ui.visuals().warn_fg_color, t.no_file);
             } else if !problems.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, t.fix_errors);
             } else if let Some(e) = &self.save_error {
                 ui.colored_label(ui.visuals().error_fg_color, format!("{} {e}", t.save_failed));
             }
-            if let Some(path) = &self.path {
+            if let Some(path) = self.writer.as_ref().and_then(TemplatesWriter::path) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.link(t.open_file).clicked() {
                         app::open_in_editor(path);
@@ -897,7 +908,7 @@ impl Editor {
         egui::Modal::new(Id::new("unsaved-templates")).show(ctx, |ui| {
             ui.label(RichText::new(t.unsaved).strong().size(15.0));
             if !can_save {
-                ui.colored_label(ui.visuals().error_fg_color, if self.path.is_none() { t.no_file } else { t.fix_errors });
+                ui.colored_label(ui.visuals().error_fg_color, if self.writer.is_none() { t.no_file } else { t.fix_errors });
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -980,6 +991,7 @@ fn grips(r: Rect) -> [(Grab, Pos2, CursorIcon); 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
 
     fn edges(l: f32, t: f32, r: f32, b: f32) -> Edges {
         Edges { l, t, r, b }
@@ -1089,11 +1101,12 @@ mod tests {
         });
     }
 
-    fn badge_editor(path: Option<&Path>) -> (Editor, egui::Context) {
+    fn badge_editor(path: Option<&std::path::Path>) -> (Editor, egui::Context) {
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
         let mut e = Editor::default();
-        e.open(&config::builtin_templates(), path, "Badge", "", Orientation::Landscape);
+        let writer = path.map(|p| TemplatesWriter(p.to_path_buf()));
+        e.open(&config::builtin_templates(), writer, "Badge", "", Orientation::Landscape);
         (e, ctx)
     }
 

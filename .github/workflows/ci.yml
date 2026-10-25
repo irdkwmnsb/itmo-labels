@@ -1,6 +1,7 @@
 # Pull requests: clippy + tests and a release build on Linux x86_64 only.
 # Pushes to main: clippy + tests on Linux, macOS and Windows, then release builds for all
-# targets, uploaded as workflow artifacts. A pushed tag v* also publishes a GitHub Release
+# targets, uploaded as workflow artifacts.
+# Both also build the web version once (for server mode) and embed it in every build. A pushed tag v* also publishes a GitHub Release
 # with the archives.
 
 name: CI
@@ -38,9 +39,30 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # The web version of the app, built once and embedded by every native build for server mode.
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - run: cargo clippy -p itmo-labels --target wasm32-unknown-unknown --locked -- -D warnings
+      - run: scripts/build-web.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: crates/gui/web/dist
+          if-no-files-found: error
+
   build:
     name: Build (${{ matrix.name }})
-    needs: check
+    needs: [check, web]
     strategy:
       fail-fast: false
       # Linux is built on the oldest supported Ubuntu so the binaries run on older glibc too.
@@ -58,6 +80,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/gui/web/dist
 
       - name: Package name
         shell: bash
