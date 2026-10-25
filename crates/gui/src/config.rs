@@ -50,13 +50,15 @@ height_mm = 20
 gap_mm = 2
 "#;
 
-const DEFAULT_TEMPLATES: &str = r#"# Label templates for ITMO Labels. This file is re-read as soon as it is saved.
+/// Written on top of `templates.toml` every time, since the editor regenerates the whole file.
+const TEMPLATES_HEADER: &str = r#"# Label templates for ITMO Labels. This file is re-read as soon as it is saved.
+# The template editor in the app rewrites it: comments other than this header are not kept.
 #
 # [[template]]
 # name        — shown in the list; also the key under which the app remembers its texts
 # orientation — optional, "portrait" or "landscape": used the first time the template is picked
 #
-# [[template.field]] — one line of text, auto-sized to fit its zone
+# [[template.field]] — a text, auto-sized to fit its zone
 # name   — label of the input box
 # x, y   — top-left corner of the zone, as fractions (0..1) of the label inside its 2 mm margins
 # w, h   — size of the zone, same units; default 1
@@ -65,8 +67,12 @@ const DEFAULT_TEMPLATES: &str = r#"# Label templates for ITMO Labels. This file 
 # max_pt — optional upper limit on the font size, in points
 # fit    — "line" (default): centre by the font's ascent/descent, so the baseline does not jump
 #          between texts; "ink": centre by the letters actually drawn, for the largest text
+# wrap   — true: break the text into lines at spaces when that makes it larger; false (default):
+#          always one line
+# sample — optional example text: the editor previews it, the input box shows it greyed out
+"#;
 
-[[template]]
+const DEFAULT_TEMPLATES: &str = r#"[[template]]
 name = "Plain text"
 
   [[template.field]]
@@ -78,20 +84,25 @@ name = "Badge"
 orientation = "landscape"
 
   [[template.field]]
-  name = "Title"
-  y = 0.18
-  h = 0.32
-  bold = true
+  name = "Team number"
+  h = 0.18
+  align = "right"
 
   [[template.field]]
-  name = "Subtitle"
-  y = 0.53
-  h = 0.19
+  name = "Name"
+  y = 0.2
+  h = 0.48
+  wrap = true
 
   [[template.field]]
-  name = "Caption"
-  y = 0.84
-  h = 0.16
+  name = "Team"
+  y = 0.7
+  h = 0.14
+
+  [[template.field]]
+  name = "University"
+  y = 0.86
+  h = 0.14
 "#;
 
 pub fn dir() -> PathBuf {
@@ -186,7 +197,7 @@ pub enum Orientation {
     Landscape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldAlign {
     Left,
@@ -205,7 +216,7 @@ impl From<FieldAlign> for Align {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldFit {
     #[default]
@@ -226,37 +237,86 @@ fn one() -> f32 {
     1.0
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// Drag-edited values are written as 0.3, not 0.30000001.
+fn rounded<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f32((v * 10_000.0).round() / 10_000.0)
+}
+
+fn rounded_opt<S: serde::Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => rounded(v, s),
+        None => s.serialize_none(),
+    }
+}
+
+/// Defaults are left out when written, so a saved file reads like a hand-written one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sample: String,
+    #[serde(default, skip_serializing_if = "is_zero", serialize_with = "rounded")]
     pub x: f32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero", serialize_with = "rounded")]
     pub y: f32,
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one", serialize_with = "rounded")]
     pub w: f32,
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one", serialize_with = "rounded")]
     pub h: f32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub align: FieldAlign,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub bold: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "rounded_opt")]
     pub max_pt: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub fit: FieldFit,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub wrap: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+impl Default for Field {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            sample: String::new(),
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            align: FieldAlign::default(),
+            bold: false,
+            max_pt: None,
+            fit: FieldFit::default(),
+            wrap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Template {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub orientation: Option<Orientation>,
     #[serde(default, rename = "field")]
     pub fields: Vec<Field>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TemplatesFile {
     #[serde(default, rename = "template")]
     templates: Vec<Template>,
@@ -274,32 +334,49 @@ fn validate_field(f: &Field) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_templates(text: &str) -> Result<Vec<Template>, String> {
-    let file: TemplatesFile = toml::from_str(text).map_err(|e| e.to_string())?;
-    if file.templates.is_empty() {
-        return Err("no [[template]] entries".into());
-    }
+/// An empty list and templates without fields are fine: the editor can get there one deletion at a time.
+fn validate_templates(templates: &[Template]) -> Result<(), String> {
     let mut names = HashSet::new();
-    for t in &file.templates {
+    for t in templates {
+        if t.name.trim().is_empty() {
+            return Err("a template has an empty name".into());
+        }
         if !names.insert(&t.name) {
             return Err(format!("template \"{}\" is defined twice", t.name));
         }
-        if t.fields.is_empty() {
-            return Err(format!("template \"{}\" has no [[template.field]]", t.name));
-        }
         let mut field_names = HashSet::new();
         for f in &t.fields {
+            if f.name.trim().is_empty() {
+                return Err(format!("template \"{}\": a field has an empty name", t.name));
+            }
             if !field_names.insert(&f.name) {
                 return Err(format!("template \"{}\": field \"{}\" is defined twice", t.name, f.name));
             }
             validate_field(f).map_err(|e| format!("template \"{}\": {e}", t.name))?;
         }
     }
+    Ok(())
+}
+
+fn parse_templates(text: &str) -> Result<Vec<Template>, String> {
+    let file: TemplatesFile = toml::from_str(text).map_err(|e| e.to_string())?;
+    validate_templates(&file.templates)?;
     Ok(file.templates)
 }
 
+fn format_templates(templates: &[Template]) -> Result<String, String> {
+    validate_templates(templates)?;
+    let body = toml::to_string(&TemplatesFile { templates: templates.to_vec() }).map_err(|e| e.to_string())?;
+    Ok(format!("{TEMPLATES_HEADER}\n{body}"))
+}
+
+/// Replaces the whole file; the header with the format description is written anew.
+pub fn write_templates(path: &Path, templates: &[Template]) -> Result<(), String> {
+    fs::write(path, format_templates(templates)?).map_err(|e| e.to_string())
+}
+
 pub fn templates_file(dir: &Path) -> io::Result<WatchedFile<Vec<Template>>> {
-    WatchedFile::open(dir, "templates.toml", DEFAULT_TEMPLATES, parse_templates)
+    WatchedFile::open(dir, "templates.toml", &format!("{TEMPLATES_HEADER}\n{DEFAULT_TEMPLATES}"), parse_templates)
 }
 
 pub fn builtin_templates() -> Vec<Template> {
@@ -385,9 +462,12 @@ mod tests {
         assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Plain text", "Badge"]);
         let badge = &t[1];
         assert_eq!(badge.orientation, Some(Orientation::Landscape));
-        assert_eq!(badge.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Title", "Subtitle", "Caption"]);
-        assert!(badge.fields[0].bold && !badge.fields[1].bold);
+        assert_eq!(badge.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Team number", "Name", "Team", "University"]);
+        assert_eq!(badge.fields[0].align, FieldAlign::Right);
+        assert!(badge.fields.iter().all(|f| !f.bold));
+        assert!(badge.fields[1].wrap && !badge.fields[2].wrap);
         assert_eq!((badge.fields[2].x, badge.fields[2].w), (0.0, 1.0), "defaults fill the width");
+        assert_eq!(badge.fields[2].h, badge.fields[3].h, "team and university get the same room");
         assert_eq!(t[0].fields[0].fit, FieldFit::Ink);
     }
 
@@ -395,8 +475,10 @@ mod tests {
     fn broken_templates_are_rejected() {
         let field = |extra: &str| format!("[[template]]\nname = \"T\"\n[[template.field]]\nname = \"F\"\n{extra}");
         assert!(parse_templates(&field("")).is_ok());
-        assert!(parse_templates("").is_err(), "no templates");
-        assert!(parse_templates("[[template]]\nname = \"T\"").is_err(), "no fields");
+        assert!(parse_templates("").unwrap().is_empty(), "no templates is a valid, empty list");
+        assert!(parse_templates("[[template]]\nname = \"T\"").unwrap()[0].fields.is_empty(), "no fields is valid too");
+        assert!(parse_templates("[[template]]\nname = \" \"").is_err(), "empty name");
+        assert!(parse_templates(&field("").replace("name = \"F\"", "name = \"\"")).is_err(), "empty field name");
         assert!(parse_templates(&field("y = 0.8\nh = 0.5")).is_err(), "zone past the bottom");
         assert!(parse_templates(&field("w = 0")).is_err(), "empty zone");
         assert!(parse_templates(&field("max_pt = -1")).is_err());
@@ -407,11 +489,42 @@ mod tests {
     }
 
     #[test]
+    fn written_templates_read_back_the_same() {
+        let mut templates = builtin_templates();
+        let f = &mut templates[1].fields[1];
+        f.sample = "Иван \"Ваня\" Иванов".into();
+        f.max_pt = Some(24.0);
+        f.bold = true;
+        f.x = 0.1 + 0.2;
+        f.w = 0.5;
+        let text = format_templates(&templates).unwrap();
+        assert!(text.starts_with(TEMPLATES_HEADER));
+        assert!(text.contains("x = 0.3\n"), "rounded:\n{text}");
+        assert!(!text.contains("w = 1"), "defaults are left out:\n{text}");
+        let mut back = parse_templates(&text).unwrap();
+        back[1].fields[1].x = templates[1].fields[1].x;
+        assert_eq!(back, templates);
+    }
+
+    #[test]
+    fn invalid_templates_are_not_written() {
+        let mut templates = builtin_templates();
+        templates[1].name = templates[0].name.clone();
+        assert!(format_templates(&templates).is_err());
+    }
+
+    #[test]
+    fn default_file_parses_with_its_header() {
+        let text = format!("{TEMPLATES_HEADER}\n{DEFAULT_TEMPLATES}");
+        assert_eq!(parse_templates(&text).unwrap(), builtin_templates());
+    }
+
+    #[test]
     fn state_round_trips() {
         let mut s = State { template: Some("Badge".into()), lang: Some(Lang::Ru), ..State::default() };
         let badge = s.templates.entry("Badge".into()).or_default();
         badge.orientation = Some(Orientation::Landscape);
-        badge.fields.insert("Title".into(), "Иван \"Ваня\" Иванов".into());
+        badge.fields.insert("Name".into(), "Иван \"Ваня\" Иванов".into());
         assert_eq!(toml::from_str::<State>(&toml::to_string(&s).unwrap()).unwrap(), s);
     }
 
