@@ -1,12 +1,13 @@
-# Every push and pull request: clippy + tests on Linux, macOS and Windows, then release
-# builds for all targets, uploaded as workflow artifacts. A pushed tag v* also publishes
-# a GitHub Release with the archives.
+# Pull requests: clippy + tests and a release build on Linux x86_64 only.
+# Pushes to main: clippy + tests on Linux, macOS and Windows, then release builds for all
+# targets, uploaded as workflow artifacts. A pushed tag v* also publishes a GitHub Release
+# with the archives.
 
 name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
 
@@ -26,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-22.04"]') || fromJSON('["ubuntu-22.04", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,25 +43,18 @@ jobs:
     needs: check
     strategy:
       fail-fast: false
+      # Linux is built on the oldest supported Ubuntu so the binaries run on older glibc too.
       matrix:
-        include:
-          # Built on the oldest supported Ubuntu so the binaries run on older glibc too.
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - name: linux-aarch64
-            os: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
-            cross_linker: aarch64-linux-gnu-gcc
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - name: windows-arm64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-          - name: macos-universal
-            os: macos-latest
-            target: aarch64-apple-darwin,x86_64-apple-darwin
+        include: >-
+          ${{ fromJSON(github.event_name == 'pull_request' && '[
+            {"name": "linux-x86_64", "os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu"}
+          ]' || '[
+            {"name": "linux-x86_64", "os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu"},
+            {"name": "linux-aarch64", "os": "ubuntu-22.04", "target": "aarch64-unknown-linux-gnu", "cross_linker": "aarch64-linux-gnu-gcc"},
+            {"name": "windows-x86_64", "os": "windows-latest", "target": "x86_64-pc-windows-msvc"},
+            {"name": "windows-arm64", "os": "windows-latest", "target": "aarch64-pc-windows-msvc"},
+            {"name": "macos-universal", "os": "macos-latest", "target": "aarch64-apple-darwin,x86_64-apple-darwin"}
+          ]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
