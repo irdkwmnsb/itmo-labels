@@ -378,13 +378,17 @@ impl App {
         paint_label(ui, ui.available_rect_before_wrap(), texture, size);
     }
 
-    fn show_editor(&mut self, ui: &mut Ui, t: &Tr) {
+    /// Called from `logic`, not `ui`: eframe skips `ui` while every window is covered
+    /// (e.g. after Cmd+Tab), and a viewport left out of a frame gets destroyed, together
+    /// with the GL surface glow may still have current, which panics on the next paint.
+    fn show_editor(&mut self, ctx: &egui::Context) {
+        let t = tr(self.lang());
         let Self { editor, fonts, sizes, .. } = self;
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("{} — ITMO Labels", t.editor_title))
             .with_inner_size([1100.0, 680.0])
             .with_min_inner_size([820.0, 500.0]);
-        let outcome = ui.ctx().show_viewport_immediate(editor::viewport_id(), builder, |ui, _| {
+        let outcome = ctx.show_viewport_immediate(editor::viewport_id(), builder, |ui, _| {
             editor.show(ui, t, fonts, &sizes.items)
         });
         for (old, new) in outcome.renames {
@@ -486,6 +490,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(1400.0, 860.0)));
             self.open_editor(ctx);
         }
+        if self.editor.is_open() {
+            self.show_editor(ctx);
+        }
         self.rerender_if_needed(ctx);
         self.save_state_if_settled();
         // Keep polling the config files and flushing state even when nothing else repaints.
@@ -501,9 +508,6 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, t));
         });
         CentralPanel::default().show(ui, |ui| self.preview(ui));
-        if self.editor.is_open() {
-            self.show_editor(ui, t);
-        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
