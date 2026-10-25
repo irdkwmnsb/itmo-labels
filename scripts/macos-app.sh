@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Builds a universal (arm64 + x86_64) "ITMO Labels.app" plus the labelprobe CLI into <out-dir>.
-# The bundle is ad-hoc signed only: on first launch macOS asks to confirm opening it.
+# Builds a universal (arm64 + x86_64) "ITMO Labels.app" plus the labelprobe CLI into <out-dir>,
+# next to "Open ITMO Labels.command", which clears the download quarantine and opens the app.
+# The bundle is ad-hoc signed only, so a quarantined copy is blocked by Gatekeeper; the
+# .command is blocked too, but needs "Open Anyway" only once and then fixes the whole folder.
+# scripts/install-macos.sh avoids the quarantine altogether.
 #
 # Usage: scripts/macos-app.sh <out-dir>
 set -euo pipefail
@@ -40,3 +43,13 @@ EOF
 
 codesign --force --sign - "$app"
 codesign --force --sign - "$out/labelprobe"
+
+launcher="$out/Open ITMO Labels.command"
+cat > "$launcher" <<'EOF'
+#!/bin/bash
+# Clears the download quarantine from this folder, then opens the app.
+cd "$(dirname "$0")" || exit 1
+xattr -dr com.apple.quarantine . 2>/dev/null
+open "ITMO Labels.app"
+EOF
+chmod +x "$launcher"
