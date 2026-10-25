@@ -6,30 +6,93 @@ use std::{
 
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, RichText, Stroke, TextEdit,
-    TextureHandle, TextureOptions, Ui, Vec2,
+    TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand,
 };
 use itmo_labels_core::{
     fonts,
+    label::Bitmap,
     render::{self, LabelSpec, Orientation as RenderOrientation, Rendered, TextField, Zone},
     tspl::Tspl,
 };
 
 use crate::{
     config::{self, Lang, Orientation, Size, State, Template, WatchedFile},
+    editor::{self, Editor},
     i18n::{Tr, tr},
     printer::{Health, Snapshot, Worker},
 };
 
-const DPI: u32 = 203;
+pub const DPI: u32 = 203;
 const SAVE_DELAY: Duration = Duration::from_secs(1);
+
+pub struct Fonts {
+    regular: fonts::Font<'static>,
+    bold: fonts::Font<'static>,
+}
+
+impl Fonts {
+    pub fn embedded() -> Self {
+        Self { regular: fonts::regular(), bold: fonts::bold() }
+    }
+}
 
 /// Everything that changes the rendered label; a change triggers a re-render.
 #[derive(PartialEq)]
-struct RenderKey {
-    size: Size,
-    template: Template,
-    orientation: Orientation,
-    texts: Vec<String>,
+pub struct RenderKey {
+    pub size: Size,
+    pub template: Template,
+    pub orientation: Orientation,
+    /// One per field.
+    pub texts: Vec<String>,
+}
+
+impl RenderKey {
+    pub fn render(&self, fonts: &Fonts) -> Rendered {
+        let fields: Vec<TextField> = self
+            .template
+            .fields
+            .iter()
+            .zip(&self.texts)
+            .map(|(f, text)| TextField {
+                text,
+                font: if f.bold { &fonts.bold } else { &fonts.regular },
+                zone: Zone { x: f.x, y: f.y, w: f.w, h: f.h },
+                align: f.align.into(),
+                fit: f.fit.into(),
+                max_pt: f.max_pt,
+                wrap: f.wrap,
+            })
+            .collect();
+        render::render(&LabelSpec {
+            width_mm: self.size.width_mm,
+            height_mm: self.size.height_mm,
+            gap_mm: self.size.gap_mm,
+            dpi: DPI,
+            orientation: match self.orientation {
+                Orientation::Portrait => RenderOrientation::Portrait,
+                Orientation::Landscape => RenderOrientation::Landscape,
+            },
+            fields: &fields,
+        })
+    }
+}
+
+pub fn texture(ctx: &egui::Context, name: &str, b: &Bitmap) -> TextureHandle {
+    let pixels = (0..b.height_px).flat_map(|y| (0..b.width_px).map(move |x| if b.get(x, y) { 0 } else { 255 }));
+    let image = ColorImage::from_gray_iter([b.width_px as usize, b.height_px as usize], pixels);
+    ctx.load_texture(name, image, TextureOptions::LINEAR)
+}
+
+/// The label centred on a grey backdrop filling `area`; returns where the label landed.
+pub fn paint_label(ui: &Ui, area: egui::Rect, texture: &TextureHandle, size_px: Vec2) -> egui::Rect {
+    ui.painter().rect_filled(area, 0.0, Color32::from_gray(200));
+    let avail = area.size() - Vec2::splat(48.0);
+    let scale = (avail.x / size_px.x).min(avail.y / size_px.y).max(0.05);
+    let rect = egui::Rect::from_center_size(area.center(), size_px * scale);
+    ui.painter().rect_filled(rect.translate(Vec2::new(2.0, 3.0)), 3.0, Color32::from_black_alpha(50));
+    egui::Image::new(texture).corner_radius(3.0).paint_at(ui, rect);
+    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
+    rect
 }
 
 /// A user-editable list that keeps its last valid contents while the file is broken.
@@ -73,8 +136,8 @@ pub struct App {
     worker: Worker,
     snapshot: Snapshot,
     rendered: Option<(RenderKey, Rendered, TextureHandle)>,
-    regular: fonts::Font<'static>,
-    bold: fonts::Font<'static>,
+    fonts: Fonts,
+    editor: Editor,
     #[cfg(debug_assertions)]
     screenshot: crate::debug::Screenshot,
 }
@@ -95,8 +158,8 @@ impl App {
             worker,
             snapshot: Snapshot::default(),
             rendered: None,
-            regular: fonts::regular(),
-            bold: fonts::bold(),
+            fonts: Fonts::embedded(),
+            editor: Editor::default(),
             #[cfg(debug_assertions)]
             screenshot: crate::debug::Screenshot::from_env(),
         }
@@ -111,9 +174,15 @@ impl App {
         self.sizes.items.iter().find(|s| Some(s.title().as_str()) == wanted).or(self.sizes.items.first())
     }
 
+    /// While the editor is open the main window works on its draft, so changes show up live.
+    fn template_list(&self) -> &[Template] {
+        if self.editor.is_open() { self.editor.live() } else { &self.templates.items }
+    }
+
     fn selected_template(&self) -> Option<&Template> {
         let wanted = self.state.template.as_deref();
-        self.templates.items.iter().find(|t| Some(t.name.as_str()) == wanted).or(self.templates.items.first())
+        let list = self.template_list();
+        list.iter().find(|t| Some(t.name.as_str()) == wanted).or(list.first())
     }
 
     /// Last choice for this template, else the template's own default.
@@ -153,35 +222,8 @@ impl App {
         if self.rendered.as_ref().is_some_and(|(k, ..)| *k == key) {
             return;
         }
-        let fields: Vec<TextField> = key
-            .template
-            .fields
-            .iter()
-            .zip(&key.texts)
-            .map(|(f, text)| TextField {
-                text,
-                font: if f.bold { &self.bold } else { &self.regular },
-                zone: Zone { x: f.x, y: f.y, w: f.w, h: f.h },
-                align: f.align.into(),
-                fit: f.fit.into(),
-                max_pt: f.max_pt,
-            })
-            .collect();
-        let r = render::render(&LabelSpec {
-            width_mm: key.size.width_mm,
-            height_mm: key.size.height_mm,
-            gap_mm: key.size.gap_mm,
-            dpi: DPI,
-            orientation: match key.orientation {
-                Orientation::Portrait => RenderOrientation::Portrait,
-                Orientation::Landscape => RenderOrientation::Landscape,
-            },
-            fields: &fields,
-        });
-        let b = &r.preview;
-        let pixels = (0..b.height_px).flat_map(|y| (0..b.width_px).map(move |x| if b.get(x, y) { 0 } else { 255 }));
-        let image = ColorImage::from_gray_iter([b.width_px as usize, b.height_px as usize], pixels);
-        let texture = ctx.load_texture("label-preview", image, TextureOptions::LINEAR);
+        let r = key.render(&self.fonts);
+        let texture = texture(ctx, "label-preview", &r.preview);
         self.rendered = Some((key, r, texture));
     }
 
@@ -194,6 +236,17 @@ impl App {
         } else {
             self.changed_at = Instant::now();
         }
+    }
+
+    fn open_editor(&mut self, ctx: &egui::Context) {
+        if self.editor.is_open() {
+            ctx.send_viewport_cmd_to(editor::viewport_id(), ViewportCommand::Focus);
+            return;
+        }
+        let template = self.selected_template().map(|t| t.name.clone()).unwrap_or_default();
+        let orientation = self.selected_template().map(|t| self.orientation(t)).unwrap_or_default();
+        let size = self.selected_size().map(Size::title).unwrap_or_default();
+        self.editor.open(&self.templates.items, self.templates.path(), &template, &size, orientation);
     }
 
     fn controls(&mut self, ui: &mut Ui, t: &Tr) {
@@ -235,25 +288,34 @@ impl App {
 
         let selected = self.selected_size().map(Size::title).unwrap_or_default();
         let titles: Vec<String> = self.sizes.items.iter().map(Size::title).collect();
-        if let Some(choice) = list_picker(ui, "size", t.size, t.edit_sizes, self.sizes.path(), &selected, &titles) {
+        let (choice, edit) = list_picker(ui, "size", t.size, t.edit_sizes, self.sizes.path(), &selected, &titles);
+        if let Some(choice) = choice {
             self.state.size = Some(choice);
+        }
+        if edit && let Some(path) = self.sizes.path() {
+            open_in_editor(path);
         }
         if let Some(e) = &self.sizes.error {
             ui.colored_label(ui.visuals().warn_fg_color, format!("{} {e}", t.sizes_error));
         }
         ui.add_space(8.0);
 
-        let Some(template) = self.selected_template().cloned() else { return };
-        let names: Vec<String> = self.templates.items.iter().map(|t| t.name.clone()).collect();
-        if let Some(choice) =
-            list_picker(ui, "template", t.template, t.edit_templates, self.templates.path(), &template.name, &names)
-        {
+        let template = self.selected_template().cloned();
+        let names: Vec<String> = self.template_list().iter().map(|t| t.name.clone()).collect();
+        let shown = template.as_ref().map_or(t.no_templates, |t| t.name.as_str());
+        let (choice, edit) =
+            list_picker(ui, "template", t.template, t.edit_templates, self.templates.path(), shown, &names);
+        if let Some(choice) = choice {
             self.state.template = Some(choice);
+        }
+        if edit {
+            self.open_editor(ui.ctx());
         }
         if let Some(e) = &self.templates.error {
             ui.colored_label(ui.visuals().warn_fg_color, format!("{} {e}", t.templates_error));
         }
         ui.add_space(8.0);
+        let Some(template) = template else { return };
 
         ui.label(t.orientation);
         let mut orientation = self.orientation(&template);
@@ -284,7 +346,7 @@ impl App {
                 .fields
                 .entry(field.name.clone())
                 .or_default();
-            ui.add(TextEdit::singleline(text).desired_width(f32::INFINITY));
+            ui.add(TextEdit::singleline(text).hint_text(field.sample.clone()).desired_width(f32::INFINITY));
         }
         ui.add_space(12.0);
 
@@ -312,19 +374,32 @@ impl App {
 
     fn preview(&self, ui: &mut Ui) {
         let Some((_, r, texture)) = &self.rendered else { return };
-        let (w, h) = (r.preview.width_px as f32, r.preview.height_px as f32);
-        let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, Color32::from_gray(200));
-        let avail = area.size() - Vec2::splat(48.0);
-        let scale = (avail.x / w).min(avail.y / h).max(0.05);
-        let rect = egui::Rect::from_center_size(area.center(), Vec2::new(w, h) * scale);
-        ui.painter().rect_filled(rect.translate(Vec2::new(2.0, 3.0)), 3.0, Color32::from_black_alpha(50));
-        egui::Image::new(texture).corner_radius(3.0).paint_at(ui, rect);
-        ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
+        let size = Vec2::new(r.preview.width_px as f32, r.preview.height_px as f32);
+        paint_label(ui, ui.available_rect_before_wrap(), texture, size);
+    }
+
+    fn show_editor(&mut self, ui: &mut Ui, t: &Tr) {
+        let Self { editor, fonts, sizes, .. } = self;
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("{} — ITMO Labels", t.editor_title))
+            .with_inner_size([1100.0, 680.0])
+            .with_min_inner_size([820.0, 500.0]);
+        let outcome = ui.ctx().show_viewport_immediate(editor::viewport_id(), builder, |ui, _| {
+            editor.show(ui, t, fonts, &sizes.items)
+        });
+        for (old, new) in outcome.renames {
+            if self.state.template.as_ref() == Some(&old) {
+                self.state.template = Some(new);
+            }
+        }
+        if let Some(saved) = outcome.saved {
+            self.templates.items = saved;
+        }
     }
 }
 
-/// Heading with an "edit file" button, then a dropdown; returns the newly picked item.
+/// Heading with an "edit" button (when there is a file to edit), then a dropdown;
+/// returns the newly picked item and whether "edit" was clicked.
 fn list_picker(
     ui: &mut Ui,
     id: &str,
@@ -333,14 +408,13 @@ fn list_picker(
     file: Option<&Path>,
     selected: &str,
     items: &[String],
-) -> Option<String> {
+) -> (Option<String>, bool) {
+    let mut edit_clicked = false;
     ui.horizontal(|ui| {
         ui.label(heading);
-        if let Some(path) = file {
+        if file.is_some() {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button(edit).clicked() {
-                    open_in_editor(path);
-                }
+                edit_clicked = ui.small_button(edit).clicked();
             });
         }
     });
@@ -352,10 +426,10 @@ fn list_picker(
             }
         }
     });
-    picked
+    (picked, edit_clicked)
 }
 
-fn open_in_editor(path: &Path) {
+pub fn open_in_editor(path: &Path) {
     let _ = if cfg!(target_os = "macos") {
         Command::new("open").arg("-t").arg(path).spawn()
     } else if cfg!(windows) {
@@ -398,6 +472,20 @@ impl eframe::App for App {
         }
         self.sizes.poll();
         self.templates.poll();
+        // An unsaved draft wins over edits to the file; without one the editor follows the file.
+        self.editor.file_changed(&self.templates.items);
+        if ctx.input(|i| i.viewport().close_requested()) && self.editor.is_open() && self.editor.dirty() {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd_to(editor::viewport_id(), ViewportCommand::Focus);
+            self.editor.ask_before_quitting();
+        }
+        // glow cannot screenshot a separate window, so the editor is drawn inside the main one.
+        #[cfg(debug_assertions)]
+        if self.screenshot.wants_editor() && !self.editor.is_open() {
+            ctx.set_embed_viewports(true);
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(1400.0, 860.0)));
+            self.open_editor(ctx);
+        }
         self.rerender_if_needed(ctx);
         self.save_state_if_settled();
         // Keep polling the config files and flushing state even when nothing else repaints.
@@ -413,6 +501,9 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, t));
         });
         CentralPanel::default().show(ui, |ui| self.preview(ui));
+        if self.editor.is_open() {
+            self.show_editor(ui, t);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

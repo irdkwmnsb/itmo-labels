@@ -7,6 +7,7 @@ mod app;
 mod config;
 #[cfg(debug_assertions)]
 mod debug;
+mod editor;
 mod i18n;
 mod printer;
 

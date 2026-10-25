@@ -1,7 +1,8 @@
 //! Host-side text rasterisation: any Unicode text in any TTF/OTF font becomes a 1-bit
 //! bitmap in printer dots, so labels do not depend on the printer's built-in fonts.
 //!
-//! A label is a set of text fields, each auto-sized independently into its own zone.
+//! A label is a set of text fields, each auto-sized independently into its own zone,
+//! on one line or word-wrapped onto several.
 
 use ab_glyph::{Font, FontRef, Glyph, PxScale, Rect, ScaleFont, point};
 
@@ -61,6 +62,8 @@ pub struct TextField<'a> {
     pub fit: Fit,
     /// Upper bound for the auto-fitted size.
     pub max_pt: Option<f32>,
+    /// Break the text into lines at spaces, as many words per line as fit.
+    pub wrap: bool,
 }
 
 pub struct LabelSpec<'a> {
@@ -123,56 +126,123 @@ fn scale_per_pt(font: &FontRef, dpi: u32) -> f32 {
     dpi as f32 / 72.0 * font.height_unscaled() / units_per_em
 }
 
+fn ink_width(font: &FontRef, text: &str, scale: PxScale) -> f32 {
+    layout(font, text, scale).1.map_or(0.0, |r| r.width())
+}
+
+/// Greedy word wrap: each line takes as many words as fit in `width`.
+fn wrap(font: &FontRef, text: &str, scale: PxScale, width: f32) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if ink_width(font, &format!("{line} {word}"), scale) <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines
+}
+
+/// A field's lines laid out at one size, each with its baseline at y = 0 and its ink box.
+struct Block {
+    lines: Vec<(Vec<Glyph>, Rect)>,
+    scale: f32,
+    /// Baseline to baseline.
+    advance: f32,
+}
+
+impl Block {
+    fn new(field: &TextField, scale: f32, width: f32) -> Self {
+        let px = PxScale::from(scale);
+        let texts = if field.wrap { wrap(field.font, field.text, px, width) } else { vec![field.text.to_owned()] };
+        let lines = texts
+            .iter()
+            .filter_map(|text| {
+                let (glyphs, ink) = layout(field.font, text, px);
+                Some((glyphs, ink?))
+            })
+            .collect();
+        let scaled = field.font.as_scaled(px);
+        Self { lines, scale, advance: scaled.height() + scaled.line_gap() }
+    }
+
+    fn width(&self) -> f32 {
+        self.lines.iter().map(|(_, ink)| ink.width()).fold(0.0, f32::max)
+    }
+
+    /// Top and bottom of what gets centred, relative to the first baseline.
+    fn extent(&self, font: &FontRef, fit: Fit) -> (f32, f32) {
+        let last = self.advance * self.lines.len().saturating_sub(1) as f32;
+        match fit {
+            // With `Line` each line box is exactly `scale` tall, since that is what PxScale measures.
+            Fit::Line => {
+                let scaled = font.as_scaled(PxScale::from(self.scale));
+                (-scaled.ascent(), last - scaled.descent())
+            }
+            Fit::Ink => self.lines.iter().enumerate().fold((f32::MAX, f32::MIN), |(top, bottom), (i, (_, ink))| {
+                let y = i as f32 * self.advance;
+                (top.min(ink.min.y + y), bottom.max(ink.max.y + y))
+            }),
+        }
+    }
+}
+
 /// Draws one field into `canvas` within the pixel rectangle `zone`; returns the size used.
 fn draw_field(canvas: &mut Bitmap, field: &TextField, zone: Rect, dpi: u32) -> Option<f32> {
     let (zw, zh) = (zone.width().max(1.0), zone.height().max(1.0));
     let per_pt = scale_per_pt(field.font, dpi);
-    let probe = 100.0;
-    let probe_ink = layout(field.font, field.text, PxScale::from(probe)).1?;
-    // With `Line` the line box is exactly `scale` tall, since that is what PxScale measures.
-    let height_per_scale = match field.fit {
-        Fit::Line => 1.0,
-        Fit::Ink => probe_ink.height() / probe,
+    let block = |scale: f32| Block::new(field, scale, zw);
+    let fits = |b: &Block| {
+        let (top, bottom) = b.extent(field.font, field.fit);
+        b.width() <= zw && bottom - top <= zh
     };
-    let mut scale = (probe * zw / probe_ink.width()).min(zh / height_per_scale);
-    if let Some(max_pt) = field.max_pt {
-        scale = scale.min(max_pt * per_pt);
+    if block(zh).lines.is_empty() {
+        return None;
     }
-    let (mut glyphs, mut ink) = layout(field.font, field.text, PxScale::from(scale));
-    // Pixel rounding makes ink grow slightly faster than linearly; shrink until it fits.
-    let too_big = |r: &Rect, scale: f32| {
-        r.width() > zw || matches!(field.fit, Fit::Ink) && r.height() > zh || matches!(field.fit, Fit::Line) && scale > zh
+    // The largest fitting size, found by bisection: measuring the real layout also covers
+    // pixel rounding and line breaks that move with the size.
+    let cap = field.max_pt.map_or(f32::INFINITY, |pt| pt * per_pt);
+    let mut hi = zh.min(cap);
+    while hi < cap && fits(&block(hi)) {
+        hi = (hi * 2.0).min(cap);
+    }
+    let block = if fits(&block(hi)) {
+        block(hi)
+    } else {
+        let mut lo = 0.0;
+        for _ in 0..24 {
+            let mid = (lo + hi) / 2.0;
+            if fits(&block(mid)) { lo = mid } else { hi = mid }
+        }
+        block(lo.max(1.0))
     };
-    while let Some(r) = ink.filter(|r| too_big(r, scale) && scale > 1.0) {
-        scale *= (zw / r.width()).min(0.99);
-        (glyphs, ink) = layout(field.font, field.text, PxScale::from(scale));
-    }
-    let ink = ink?;
 
-    let dx = match field.align {
-        Align::Left => zone.min.x - ink.min.x,
-        Align::Center => zone.min.x + (zw - ink.width()) / 2.0 - ink.min.x,
-        Align::Right => zone.max.x - ink.max.x,
-    };
-    let dy = match field.fit {
-        // Baseline such that the ascent..descent box is centred in the zone.
-        Fit::Line => zone.min.y + (zh - scale) / 2.0 + field.font.as_scaled(PxScale::from(scale)).ascent(),
-        Fit::Ink => zone.min.y + (zh - ink.height()) / 2.0 - ink.min.y,
-    };
-    // Whole-pixel offsets so every glyph shifts identically.
-    let (dx, dy) = (dx.round(), dy.round());
+    let (top, bottom) = block.extent(field.font, field.fit);
+    let baseline = zone.min.y + (zh - (bottom - top)) / 2.0 - top;
     let (w, h) = (canvas.width_px, canvas.height_px);
-    for glyph in glyphs {
-        let Some(outline) = field.font.outline_glyph(glyph) else { continue };
-        let b = outline.px_bounds();
-        outline.draw(|x, y, coverage| {
-            let (px, py) = (b.min.x + dx + x as f32, b.min.y + dy + y as f32);
-            if coverage >= INK_THRESHOLD && px >= 0.0 && py >= 0.0 && (px as u32) < w && (py as u32) < h {
-                canvas.set(px as u32, py as u32);
-            }
-        });
+    for (i, (glyphs, ink)) in block.lines.into_iter().enumerate() {
+        let dx = match field.align {
+            Align::Left => zone.min.x - ink.min.x,
+            Align::Center => zone.min.x + (zw - ink.width()) / 2.0 - ink.min.x,
+            Align::Right => zone.max.x - ink.max.x,
+        };
+        let dy = baseline + i as f32 * block.advance;
+        // Whole-pixel offsets so every glyph of the line shifts identically.
+        let (dx, dy) = (dx.round(), dy.round());
+        for glyph in glyphs {
+            let Some(outline) = field.font.outline_glyph(glyph) else { continue };
+            let b = outline.px_bounds();
+            outline.draw(|x, y, coverage| {
+                let (px, py) = (b.min.x + dx + x as f32, b.min.y + dy + y as f32);
+                if coverage >= INK_THRESHOLD && px >= 0.0 && py >= 0.0 && (px as u32) < w && (py as u32) < h {
+                    canvas.set(px as u32, py as u32);
+                }
+            });
+        }
     }
-    Some(scale / per_pt)
+    Some(block.scale / per_pt)
 }
 
 pub fn render(spec: &LabelSpec) -> Rendered {
@@ -220,7 +290,7 @@ mod tests {
     use crate::fonts;
 
     fn field<'a>(font: &'a FontRef<'a>, text: &'a str, zone: Zone, fit: Fit) -> TextField<'a> {
-        TextField { text, font, zone, align: Align::Center, fit, max_pt: None }
+        TextField { text, font, zone, align: Align::Center, fit, max_pt: None, wrap: false }
     }
 
     fn spec<'a>(fields: &'a [TextField<'a>], w: f32, h: f32, orientation: Orientation) -> LabelSpec<'a> {
@@ -345,6 +415,63 @@ mod tests {
         let (_, _, rx1, _) = ink_box(&r.preview, 0..u32::MAX).unwrap();
         assert!(lx0.abs_diff(m) <= 1, "left edge {lx0} vs margin {m}");
         assert!(rx1.abs_diff(r.preview.width_px - m - 1) <= 1, "right edge {rx1}");
+    }
+
+    /// Rows with ink, grouped into runs separated by blank rows.
+    fn ink_rows(b: &Bitmap) -> Vec<(u32, u32)> {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for y in 0..b.height_px {
+            if (0..b.width_px).any(|x| b.get(x, y)) {
+                match runs.last_mut() {
+                    Some((_, end)) if *end + 1 == y => *end = y,
+                    _ => runs.push((y, y)),
+                }
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_when_that_is_larger() {
+        let font = fonts::regular();
+        let one = [field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line)];
+        let two = [TextField { wrap: true, ..field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line) }];
+        let one = render(&spec(&one, 50.0, 70.0, Orientation::Landscape));
+        let two = render(&spec(&two, 50.0, 70.0, Orientation::Landscape));
+        assert_eq!(ink_rows(&one.preview).len(), 1);
+        assert_eq!(ink_rows(&two.preview).len(), 2, "surname and name on their own lines");
+        assert!(two.sizes_pt[0].unwrap() > one.sizes_pt[0].unwrap());
+    }
+
+    #[test]
+    fn wrap_keeps_short_text_on_one_line() {
+        let font = fonts::regular();
+        // A wide, low zone: two lines would have to be half as tall.
+        let zone = Zone { x: 0.0, y: 0.0, w: 1.0, h: 0.2 };
+        let fields = [TextField { wrap: true, ..field(&font, "Ян Ли", zone, Fit::Line) }];
+        let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
+        assert_eq!(ink_rows(&r.preview).len(), 1);
+    }
+
+    #[test]
+    fn wrapped_lines_stay_inside_zone_and_are_centred() {
+        let font = fonts::bold();
+        let zone = Zone { x: 0.0, y: 0.35, w: 1.0, h: 0.65 };
+        for fit in [Fit::Line, Fit::Ink] {
+            let fields = [TextField { wrap: true, ..field(&font, "Римский-Корсаков Николай Андреевич", zone, fit) }];
+            let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
+            let m = dots(MARGIN_MM, 203);
+            let content_h = r.preview.height_px as f32 - 2.0 * m as f32;
+            let (x0, y0, x1, y1) = ink_box(&r.preview, 0..u32::MAX).unwrap();
+            assert!(y0 as f32 >= m as f32 + 0.35 * content_h - 1.0, "{fit:?} top {y0}");
+            assert!(x0 >= m && x1 < r.preview.width_px - m && y1 < r.preview.height_px - m, "{fit:?}");
+            let lines = ink_rows(&r.preview);
+            assert!(lines.len() >= 2, "{fit:?}");
+            for (from, to) in lines {
+                let (lx0, _, lx1, _) = ink_box(&r.preview, from..to + 1).unwrap();
+                assert!((lx0 - m).abs_diff(r.preview.width_px - m - 1 - lx1) <= 2, "{fit:?} line not centred");
+            }
+        }
     }
 
     #[test]

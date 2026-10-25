@@ -1,6 +1,7 @@
 //! Debug builds only: `ITMO_LABELS_SCREENSHOT=out.ppm` saves the window a few seconds
 //! after start (once the printer worker has reported) and quits. Used to check the layout
-//! without a human looking at the screen.
+//! without a human looking at the screen. With `ITMO_LABELS_SCREENSHOT_EDITOR=1` the template
+//! editor is opened too, embedded in the main window.
 
 use std::{
     fs,
@@ -16,11 +17,21 @@ pub struct Screenshot {
     path: Option<PathBuf>,
     started: Instant,
     requested: bool,
+    editor: bool,
 }
 
 impl Screenshot {
     pub fn from_env() -> Self {
-        Self { path: std::env::var_os("ITMO_LABELS_SCREENSHOT").map(PathBuf::from), started: Instant::now(), requested: false }
+        Self {
+            path: std::env::var_os("ITMO_LABELS_SCREENSHOT").map(PathBuf::from),
+            started: Instant::now(),
+            requested: false,
+            editor: std::env::var_os("ITMO_LABELS_SCREENSHOT_EDITOR").is_some(),
+        }
+    }
+
+    pub fn wants_editor(&self) -> bool {
+        self.path.is_some() && self.editor
     }
 
     pub fn tick(&mut self, ctx: &egui::Context) {

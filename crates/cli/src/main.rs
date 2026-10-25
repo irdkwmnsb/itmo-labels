@@ -164,6 +164,7 @@ fn run(args: &[String]) -> Result<()> {
                 align: Align::Center,
                 fit: Fit::Ink,
                 max_pt: None,
+                wrap: false,
             }];
             let r = render::render(&LabelSpec {
                 width_mm: w.parse()?,
