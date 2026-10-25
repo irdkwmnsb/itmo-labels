@@ -137,8 +137,7 @@ impl Worker {
 }
 
 fn query_status(p: &mut dyn Transport) -> io::Result<Option<Status>> {
-    p.write(Status::QUERY)?;
-    Ok(p.read(Duration::from_millis(300))?.first().map(|&b| Status(b)))
+    Status::query(p, Duration::from_millis(300))
 }
 
 fn scan(selected: Option<&str>) -> (Vec<String>, Option<Health>) {
