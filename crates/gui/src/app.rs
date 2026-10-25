@@ -1,21 +1,21 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, DragValue, Layout, Panel, RichText, Stroke,
-    TextEdit, TextureHandle, TextureOptions, Ui, Vec2,
+    self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, RichText, Stroke, TextEdit,
+    TextureHandle, TextureOptions, Ui, Vec2,
 };
 use itmo_labels_core::{
     fonts,
-    render::{self, Orientation as RenderOrientation, Rendered, TextLabel},
+    render::{self, LabelSpec, Orientation as RenderOrientation, Rendered, TextField, Zone},
     tspl::Tspl,
 };
 
 use crate::{
-    config::{self, Lang, Orientation, Size, SizesFileWatch, State},
+    config::{self, Lang, Orientation, Size, State, Template, WatchedFile},
     i18n::{Tr, tr},
     printer::{Health, Snapshot, Worker},
 };
@@ -26,11 +26,41 @@ const SAVE_DELAY: Duration = Duration::from_secs(1);
 /// Everything that changes the rendered label; a change triggers a re-render.
 #[derive(PartialEq)]
 struct RenderKey {
-    size: Option<Size>,
+    size: Size,
+    template: Template,
     orientation: Orientation,
-    bold: bool,
-    size_pt: Option<f32>,
-    text: String,
+    texts: Vec<String>,
+}
+
+/// A user-editable list that keeps its last valid contents while the file is broken.
+struct Watched<T> {
+    items: Vec<T>,
+    file: Option<WatchedFile<Vec<T>>>,
+    error: Option<String>,
+}
+
+impl<T> Watched<T> {
+    fn new(builtin: Vec<T>, file: std::io::Result<WatchedFile<Vec<T>>>) -> Self {
+        match file {
+            Ok(file) => Self { items: builtin, file: Some(file), error: None },
+            Err(e) => Self { items: builtin, file: None, error: Some(e.to_string()) },
+        }
+    }
+
+    fn poll(&mut self) {
+        match self.file.as_mut().and_then(WatchedFile::poll) {
+            Some(Ok(items)) => {
+                self.items = items;
+                self.error = None;
+            }
+            Some(Err(e)) => self.error = Some(e),
+            None => {}
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.file.as_ref().map(|f| f.path.as_path())
+    }
 }
 
 pub struct App {
@@ -38,9 +68,8 @@ pub struct App {
     state: State,
     saved: State,
     changed_at: Instant,
-    sizes: Vec<Size>,
-    sizes_watch: Option<SizesFileWatch>,
-    sizes_error: Option<String>,
+    sizes: Watched<Size>,
+    templates: Watched<Template>,
     worker: Worker,
     snapshot: Snapshot,
     rendered: Option<(RenderKey, Rendered, TextureHandle)>,
@@ -54,20 +83,15 @@ impl App {
     pub fn new(ctx: &egui::Context) -> Self {
         let dir = config::dir();
         let state = State::load(&dir);
-        let (sizes_watch, sizes_error) = match SizesFileWatch::open(&dir) {
-            Ok(w) => (Some(w), None),
-            Err(e) => (None, Some(format!("{}: {e}", dir.display()))),
-        };
         let wake = ctx.clone();
         let worker = Worker::spawn(state.printer.clone(), move || wake.request_repaint());
         Self {
+            sizes: Watched::new(config::builtin_sizes(), config::sizes_file(&dir)),
+            templates: Watched::new(config::builtin_templates(), config::templates_file(&dir)),
             dir,
             saved: state.clone(),
             state,
             changed_at: Instant::now(),
-            sizes: config::builtin_sizes(),
-            sizes_watch,
-            sizes_error,
             worker,
             snapshot: Snapshot::default(),
             rendered: None,
@@ -84,63 +108,81 @@ impl App {
 
     fn selected_size(&self) -> Option<&Size> {
         let wanted = self.state.size.as_deref();
-        self.sizes.iter().find(|s| Some(s.title().as_str()) == wanted).or(self.sizes.first())
+        self.sizes.items.iter().find(|s| Some(s.title().as_str()) == wanted).or(self.sizes.items.first())
     }
 
-    fn render_key(&self) -> RenderKey {
-        RenderKey {
-            size: self.selected_size().cloned(),
-            orientation: self.state.orientation,
-            bold: self.state.bold,
-            size_pt: (!self.state.auto_size).then_some(self.state.size_pt),
-            text: self.state.text.clone(),
-        }
+    fn selected_template(&self) -> Option<&Template> {
+        let wanted = self.state.template.as_deref();
+        self.templates.items.iter().find(|t| Some(t.name.as_str()) == wanted).or(self.templates.items.first())
+    }
+
+    /// Last choice for this template, else the template's own default.
+    fn orientation(&self, template: &Template) -> Orientation {
+        self.state
+            .templates
+            .get(&template.name)
+            .and_then(|s| s.orientation)
+            .or(template.orientation)
+            .unwrap_or_default()
+    }
+
+    fn texts(&self, template: &Template) -> Vec<String> {
+        let saved = self.state.templates.get(&template.name);
+        template
+            .fields
+            .iter()
+            .map(|f| saved.and_then(|s| s.fields.get(&f.name)).cloned().unwrap_or_default())
+            .collect()
+    }
+
+    fn render_key(&self) -> Option<RenderKey> {
+        let template = self.selected_template()?.clone();
+        Some(RenderKey {
+            size: self.selected_size()?.clone(),
+            orientation: self.orientation(&template),
+            texts: self.texts(&template),
+            template,
+        })
     }
 
     fn rerender_if_needed(&mut self, ctx: &egui::Context) {
-        let key = self.render_key();
-        if self.rendered.as_ref().is_some_and(|(k, ..)| *k == key) {
-            return;
-        }
-        let Some(size) = &key.size else {
+        let Some(key) = self.render_key() else {
             self.rendered = None;
             return;
         };
-        let font = if key.bold { &self.bold } else { &self.regular };
-        let r = render::render(&TextLabel {
-            width_mm: size.width_mm,
-            height_mm: size.height_mm,
-            gap_mm: size.gap_mm,
+        if self.rendered.as_ref().is_some_and(|(k, ..)| *k == key) {
+            return;
+        }
+        let fields: Vec<TextField> = key
+            .template
+            .fields
+            .iter()
+            .zip(&key.texts)
+            .map(|(f, text)| TextField {
+                text,
+                font: if f.bold { &self.bold } else { &self.regular },
+                zone: Zone { x: f.x, y: f.y, w: f.w, h: f.h },
+                align: f.align.into(),
+                fit: f.fit.into(),
+                max_pt: f.max_pt,
+            })
+            .collect();
+        let r = render::render(&LabelSpec {
+            width_mm: key.size.width_mm,
+            height_mm: key.size.height_mm,
+            gap_mm: key.size.gap_mm,
             dpi: DPI,
             orientation: match key.orientation {
                 Orientation::Portrait => RenderOrientation::Portrait,
                 Orientation::Landscape => RenderOrientation::Landscape,
             },
-            font,
-            text: &key.text,
-            size_pt: key.size_pt,
+            fields: &fields,
         });
         let b = &r.preview;
         let pixels = (0..b.height_px).flat_map(|y| (0..b.width_px).map(move |x| if b.get(x, y) { 0 } else { 255 }));
         let image = ColorImage::from_gray_iter([b.width_px as usize, b.height_px as usize], pixels);
         let texture = ctx.load_texture("label-preview", image, TextureOptions::LINEAR);
-        if self.state.auto_size {
-            // Seed the manual size with the fitted one, so unticking "Auto" starts from what is on screen.
-            self.state.size_pt = (r.size_pt * 2.0).round() / 2.0;
-        }
         self.rendered = Some((key, r, texture));
-    }
-
-    fn poll_sizes(&mut self) {
-        let Some(watch) = &mut self.sizes_watch else { return };
-        match watch.poll() {
-            Some(Ok(sizes)) => {
-                self.sizes = sizes;
-                self.sizes_error = None;
-            }
-            Some(Err(e)) => self.sizes_error = Some(e),
-            None => {}
-        }
     }
 
     fn save_state_if_settled(&mut self) {
@@ -152,18 +194,6 @@ impl App {
         } else {
             self.changed_at = Instant::now();
         }
-    }
-
-    fn open_sizes_file(&self) {
-        let Some(watch) = &self.sizes_watch else { return };
-        let path = watch.path.as_os_str();
-        let _ = if cfg!(target_os = "macos") {
-            Command::new("open").arg("-t").arg(path).spawn()
-        } else if cfg!(windows) {
-            Command::new("notepad").arg(path).spawn()
-        } else {
-            Command::new("xdg-open").arg(path).spawn()
-        };
     }
 
     fn controls(&mut self, ui: &mut Ui, t: &Tr) {
@@ -203,55 +233,64 @@ impl App {
         }
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label(t.size);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button(t.edit_sizes).clicked() {
-                    self.open_sizes_file();
-                }
-            });
-        });
         let selected = self.selected_size().map(Size::title).unwrap_or_default();
-        ComboBox::from_id_salt("size").width(ui.available_width()).selected_text(&selected).show_ui(ui, |ui| {
-            for s in &self.sizes {
-                let title = s.title();
-                if ui.selectable_label(title == selected, &title).clicked() {
-                    self.state.size = Some(title);
-                }
-            }
-        });
-        if let Some(e) = &self.sizes_error {
+        let titles: Vec<String> = self.sizes.items.iter().map(Size::title).collect();
+        if let Some(choice) = list_picker(ui, "size", t.size, t.edit_sizes, self.sizes.path(), &selected, &titles) {
+            self.state.size = Some(choice);
+        }
+        if let Some(e) = &self.sizes.error {
             ui.colored_label(ui.visuals().warn_fg_color, format!("{} {e}", t.sizes_error));
         }
         ui.add_space(8.0);
 
+        let Some(template) = self.selected_template().cloned() else { return };
+        let names: Vec<String> = self.templates.items.iter().map(|t| t.name.clone()).collect();
+        if let Some(choice) =
+            list_picker(ui, "template", t.template, t.edit_templates, self.templates.path(), &template.name, &names)
+        {
+            self.state.template = Some(choice);
+        }
+        if let Some(e) = &self.templates.error {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("{} {e}", t.templates_error));
+        }
+        ui.add_space(8.0);
+
         ui.label(t.orientation);
+        let mut orientation = self.orientation(&template);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.state.orientation, Orientation::Portrait, t.portrait);
-            ui.selectable_value(&mut self.state.orientation, Orientation::Landscape, t.landscape);
+            ui.selectable_value(&mut orientation, Orientation::Portrait, t.portrait);
+            ui.selectable_value(&mut orientation, Orientation::Landscape, t.landscape);
         });
+        if orientation != self.orientation(&template) {
+            self.state.templates.entry(template.name.clone()).or_default().orientation = Some(orientation);
+        }
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label(t.font_size);
-            ui.checkbox(&mut self.state.auto_size, t.auto);
-            ui.add_enabled(
-                !self.state.auto_size,
-                DragValue::new(&mut self.state.size_pt).range(4.0..=400.0).speed(0.5).suffix(" pt"),
-            );
-            ui.checkbox(&mut self.state.bold, t.bold);
-        });
-        ui.add_space(8.0);
-
-        ui.label(t.text);
-        ui.add(TextEdit::singleline(&mut self.state.text).hint_text(t.text_hint).desired_width(f32::INFINITY));
-        if self.rendered.as_ref().is_some_and(|(_, r, _)| r.overflows) {
-            ui.colored_label(ui.visuals().warn_fg_color, t.overflow);
+        let sizes_pt = self.rendered.as_ref().map(|(_, r, _)| r.sizes_pt.clone()).unwrap_or_default();
+        for (i, field) in template.fields.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(&field.name);
+                if let Some(Some(pt)) = sizes_pt.get(i) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.weak(format!("{pt:.0} pt"));
+                    });
+                }
+            });
+            let text = self
+                .state
+                .templates
+                .entry(template.name.clone())
+                .or_default()
+                .fields
+                .entry(field.name.clone())
+                .or_default();
+            ui.add(TextEdit::singleline(text).desired_width(f32::INFINITY));
         }
         ui.add_space(12.0);
 
+        let has_text = self.texts(&template).iter().any(|s| !s.trim().is_empty());
         let ready = self.snapshot.health == Some(Health::Ready) && !self.snapshot.busy_printing;
-        let can_print = ready && !self.state.text.trim().is_empty() && self.rendered.is_some();
+        let can_print = ready && has_text && self.rendered.is_some();
         let label = if self.snapshot.busy_printing { t.printing } else { t.print };
         let button = Button::new(RichText::new(label).size(18.0)).min_size(Vec2::new(ui.available_width(), 40.0));
         if ui.add_enabled(can_print, button).clicked()
@@ -285,6 +324,47 @@ impl App {
     }
 }
 
+/// Heading with an "edit file" button, then a dropdown; returns the newly picked item.
+fn list_picker(
+    ui: &mut Ui,
+    id: &str,
+    heading: &str,
+    edit: &str,
+    file: Option<&Path>,
+    selected: &str,
+    items: &[String],
+) -> Option<String> {
+    ui.horizontal(|ui| {
+        ui.label(heading);
+        if let Some(path) = file {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(edit).clicked() {
+                    open_in_editor(path);
+                }
+            });
+        }
+    });
+    let mut picked = None;
+    ComboBox::from_id_salt(id).width(ui.available_width()).selected_text(selected).show_ui(ui, |ui| {
+        for item in items {
+            if ui.selectable_label(item == selected, item).clicked() {
+                picked = Some(item.clone());
+            }
+        }
+    });
+    picked
+}
+
+fn open_in_editor(path: &Path) {
+    let _ = if cfg!(target_os = "macos") {
+        Command::new("open").arg("-t").arg(path).spawn()
+    } else if cfg!(windows) {
+        Command::new("notepad").arg(path).spawn()
+    } else {
+        Command::new("xdg-open").arg(path).spawn()
+    };
+}
+
 fn status_line(ui: &mut Ui, t: &Tr, s: &Snapshot) {
     let (text, color) = match &s.health {
         None => (t.checking.to_owned(), Color32::GRAY),
@@ -316,10 +396,11 @@ impl eframe::App for App {
             self.state.printer = Some(first.clone());
             self.worker.select(Some(first.clone()));
         }
-        self.poll_sizes();
+        self.sizes.poll();
+        self.templates.poll();
         self.rerender_if_needed(ctx);
         self.save_state_if_settled();
-        // Keep polling sizes.toml and flushing state even when nothing else repaints.
+        // Keep polling the config files and flushing state even when nothing else repaints.
         ctx.request_repaint_after(Duration::from_secs(1));
         #[cfg(debug_assertions)]
         self.screenshot.tick(ctx);
@@ -329,7 +410,7 @@ impl eframe::App for App {
         let t = tr(self.lang());
         Panel::left("controls").exact_size(320.0).show(ui, |ui| {
             ui.add_space(8.0);
-            self.controls(ui, t);
+            egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, t));
         });
         CentralPanel::default().show(ui, |ui| self.preview(ui));
     }

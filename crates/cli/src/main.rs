@@ -14,7 +14,7 @@ use std::{env, fs, process::ExitCode, time::Duration};
 use itmo_labels_core::{
     fonts,
     label::{Bitmap, Element, Font, Label, Rect, Rotation, Text},
-    render::{self, Orientation, TextLabel},
+    render::{self, Align, Fit, LabelSpec, Orientation, TextField, Zone},
     transport::{self, Transport},
     tspl::{Status, Tspl},
 };
@@ -157,22 +157,28 @@ fn run(args: &[String]) -> Result<()> {
                 other => return Err(format!("unknown orientation {other}").into()),
             };
             let font = fonts::regular();
-            let r = render::render(&TextLabel {
+            let fields = [TextField {
+                text: arg(3, "text")?,
+                font: &font,
+                zone: Zone::FULL,
+                align: Align::Center,
+                fit: Fit::Ink,
+                max_pt: None,
+            }];
+            let r = render::render(&LabelSpec {
                 width_mm: w.parse()?,
                 height_mm: h.parse()?,
                 gap_mm: 2.0,
                 dpi: 203,
                 orientation,
-                font: &font,
-                text: arg(3, "text")?,
-                size_pt: None,
+                fields: &fields,
             });
             let out = arg(4, "output")?;
             // PBM P4 rows are 1 bpp, MSB first, 1 = black: exactly our Bitmap layout.
             let mut pbm = format!("P4\n{} {}\n", r.preview.width_px, r.preview.height_px).into_bytes();
             pbm.extend_from_slice(&r.preview.data);
             fs::write(out, pbm)?;
-            println!("{out}: {:.1} pt", r.size_pt);
+            println!("{out}: {:.1} pt", r.sizes_pt[0].unwrap_or(0.0));
             Ok(())
         }
         _ => Err("usage: labelprobe list | devid | status | query <bytes> | send <file> | test [--dry-run] | render <WxH> <portrait|landscape> <text> <out.pbm>".into()),
