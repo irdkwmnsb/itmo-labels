@@ -1,11 +1,12 @@
 //! TSPL/TSPL2 encoder (TSC and the many clones that report `CMD:XPP,XL` or `CMD:TSPL`).
 
-use std::{fmt::Write as _, io, time::Duration};
+use std::fmt::Write as _;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{io, time::Duration};
 
-use crate::{
-    label::{Bitmap, Element, Font, Label, Rect, Rotation, Text},
-    transport::Transport,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::transport::Transport;
+use crate::label::{Bitmap, Element, Font, Label, Rect, Rotation, Text};
 
 #[derive(Debug)]
 pub enum EncodeError {
@@ -122,6 +123,7 @@ impl Status {
     /// host side of the bulk IN data toggle while the printer keeps its own, so the host
     /// takes the next packet for a retransmission and drops it. That packet still flips
     /// the printer's toggle, so the second query's reply gets through.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn query(p: &mut dyn Transport, quiet: Duration) -> io::Result<Option<Self>> {
         for _ in 0..2 {
             p.write(Self::QUERY)?;

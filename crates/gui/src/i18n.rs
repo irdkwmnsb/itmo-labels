@@ -2,6 +2,8 @@
 
 use crate::config::Lang;
 
+// Some strings belong to native-only parts: server mode, the editor's window title.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Tr {
     pub printer: &'static str,
     pub no_printers: &'static str,
@@ -83,6 +85,18 @@ pub struct Tr {
     pub pick_field: &'static str,
     pub keys: &'static str,
     pub keys_help: &'static str,
+    pub close: &'static str,
+    pub server: &'static str,
+    pub port: &'static str,
+    pub server_failed: &'static str,
+    pub server_open: &'static str,
+    pub other_addresses: &'static str,
+    pub no_addresses: &'static str,
+    pub jobs: &'static str,
+    pub no_jobs: &'static str,
+    pub this_device: &'static str,
+    pub job_sent: &'static str,
+    pub kb: &'static str,
 }
 
 pub const RU: Tr = Tr {
@@ -166,6 +180,18 @@ pub const RU: Tr = Tr {
     pick_field: "Выберите поле на холсте или в списке",
     keys: "Клавиши",
     keys_help: "Стрелки — сдвинуть поле (Shift — на 0.1)\nAlt+стрелки — изменить размер\nDelete, Backspace — удалить поле\nCmd/Ctrl+D — копия поля\nTab, Shift+Tab — следующее, предыдущее поле\nEsc — снять выделение\nCmd/Ctrl+Z, Shift+Cmd/Ctrl+Z — шаг назад, вперёд\nCmd/Ctrl+S — сохранить",
+    close: "Закрыть",
+    server: "Режим сервера",
+    port: "Порт",
+    server_failed: "Сервер не запустился, пробую снова каждые 5\u{a0}с:",
+    server_open: "Откройте в браузере в этой сети:",
+    other_addresses: "Другие адреса:",
+    no_addresses: "Сетевых адресов нет, доступен только с этого компьютера",
+    jobs: "Последние задания",
+    no_jobs: "Заданий пока не было",
+    this_device: "это устройство",
+    job_sent: "отправлено",
+    kb: "КБ",
 };
 
 pub const EN: Tr = Tr {
@@ -249,6 +275,18 @@ pub const EN: Tr = Tr {
     pick_field: "Select a field on the canvas or in the list",
     keys: "Keys",
     keys_help: "Arrows — move the field (Shift — by 0.1)\nAlt+arrows — resize\nDelete, Backspace — delete the field\nCmd/Ctrl+D — duplicate the field\nTab, Shift+Tab — next, previous field\nEsc — deselect\nCmd/Ctrl+Z, Shift+Cmd/Ctrl+Z — undo, redo\nCmd/Ctrl+S — save",
+    close: "Close",
+    server: "Server mode",
+    port: "Port",
+    server_failed: "The server did not start, retrying every 5\u{a0}s:",
+    server_open: "Open in a browser on this network:",
+    other_addresses: "Other addresses:",
+    no_addresses: "No network addresses, reachable from this computer only",
+    jobs: "Recent jobs",
+    no_jobs: "No jobs yet",
+    this_device: "this device",
+    job_sent: "sent",
+    kb: "KB",
 };
 
 pub fn tr(lang: Lang) -> &'static Tr {

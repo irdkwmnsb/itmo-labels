@@ -1,15 +1,23 @@
 //! ITMO Labels: one line of text onto a USB label printer, no drivers needed.
+//! The same app also builds for the web, where it is served by another copy in server mode.
 
 // No console window on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod config;
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 mod debug;
 mod editor;
 mod i18n;
 mod printer;
+mod query;
+#[cfg(not(target_arch = "wasm32"))]
+mod server;
+#[cfg(not(target_arch = "wasm32"))]
+mod serving;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use itmo_labels_core::fonts;
@@ -24,6 +32,7 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(defs);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -40,4 +49,34 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::App::new(&cc.egui_ctx)))
         }),
     )
+}
+
+/// Started by `index.html`; draws into its `<canvas id="app">`.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast;
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window().and_then(|w| w.document()).expect("runs in a page");
+        let canvas = document
+            .get_element_by_id("app")
+            .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            .expect("index.html has a canvas#app");
+        let started = eframe::WebRunner::new()
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(|cc| {
+                    install_fonts(&cc.egui_ctx);
+                    Ok(Box::new(app::App::new(&cc.egui_ctx)))
+                }),
+            )
+            .await;
+        if let Some(loading) = document.get_element_by_id("loading") {
+            match started {
+                Ok(()) => loading.remove(),
+                Err(e) => loading.set_text_content(Some(&format!("Failed to start: {e:?}"))),
+            }
+        }
+    });
 }
