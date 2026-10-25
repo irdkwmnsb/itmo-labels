@@ -6,7 +6,8 @@
   <title>ITMO Labels</title>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1b1b1b; }
-    canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
+    canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%;
+             touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
     #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
                font: 16px Helvetica, Arial, sans-serif; color: #aaa; }
   </style>
@@ -16,6 +17,9 @@
   <div id="loading">Loading…</div>
   <script type="module">
     import init from "./itmo-labels.js";
+    // A tap now ends in mousedown on the canvas, whose default action would move the focus
+    // from the app's hidden text input back to the canvas and close the keyboard again.
+    document.getElementById("app").addEventListener("mousedown", (e) => e.preventDefault());
     init().catch((e) => { document.getElementById("loading").textContent = "Failed to start: " + e; });
   </script>
 </body>
