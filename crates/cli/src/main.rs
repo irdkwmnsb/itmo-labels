@@ -66,9 +66,7 @@ fn list() -> Result<()> {
 }
 
 fn query_status(p: &mut dyn Transport) -> Result<Status> {
-    p.write(Status::QUERY)?;
-    let reply = p.read(Duration::from_millis(500))?;
-    Ok(Status(*reply.first().ok_or("no reply to <ESC>!?")?))
+    Ok(Status::query(p, Duration::from_millis(500))?.ok_or("no reply to <ESC>!?")?)
 }
 
 /// 50×70 mm label exercising every element kind: border to check alignment,
