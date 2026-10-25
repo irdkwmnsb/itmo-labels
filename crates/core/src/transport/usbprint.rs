@@ -2,7 +2,10 @@
 //! (`GUID_DEVINTERFACE_USBPRINT`) is a file handle whose reads and writes go straight to
 //! the bulk endpoints. No driver install, no admin rights.
 
-use std::{io, mem, ptr, time::Duration};
+use std::{
+    io, mem, ptr, thread,
+    time::{Duration, Instant},
+};
 
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::{
@@ -28,6 +31,8 @@ use super::{Found, Transport, parse_device_id};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pause between reads that came back empty, so waiting for a reply does not spin.
+const EMPTY_READ_BACKOFF: Duration = Duration::from_millis(10);
 
 /// NUL-terminated device interface paths, e.g. `\\?\usb#vid_353d&pid_1154#...#{28d78fad-...}`.
 fn interface_paths() -> io::Result<Vec<Vec<u16>>> {
@@ -155,13 +160,24 @@ impl Transport for UsbPrint {
     fn read(&mut self, quiet: Duration) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
+        // A read completes with 0 bytes when the printer has nothing yet (a zero-length
+        // packet), so silence is measured by the clock, not by empty reads.
+        let mut deadline = Instant::now() + quiet;
         loop {
-            let n = self.overlapped(quiet, |ov| unsafe {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(out);
+            }
+            let n = self.overlapped(left, |ov| unsafe {
                 ReadFile(self.file.0, buf.as_mut_ptr(), buf.len() as u32, ptr::null_mut(), ov)
             })?;
             match n {
-                Some(n) if n > 0 => out.extend_from_slice(&buf[..n as usize]),
-                _ => return Ok(out),
+                Some(0) => thread::sleep(EMPTY_READ_BACKOFF.min(left)),
+                Some(n) => {
+                    out.extend_from_slice(&buf[..n as usize]);
+                    deadline = Instant::now() + quiet;
+                }
+                None => return Ok(out),
             }
         }
     }
