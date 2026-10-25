@@ -103,3 +103,21 @@ assets/fonts  Helvetica Regular и Bold (проприетарные, репоз�
 
 Отладка: debug-сборка с `ITMO_LABELS_SCREENSHOT=out.ppm` через 3 секунды сохраняет
 скриншот окна и закрывается.
+
+## CI и релизы
+
+`.github/workflows/ci.yml` на каждый push и pull request:
+
+1. `check` — `cargo clippy -D warnings` и `cargo test` на Linux, macOS и Windows;
+2. `build` — release-сборка GUI и `labelprobe`, артефакты рана:
+   - `linux-x86_64`, `linux-aarch64` — `tar.gz` (сборка на Ubuntu 22.04, aarch64 кросс-линковкой);
+   - `windows-x86_64`, `windows-arm64` — `zip` с `.exe` (arm64 кросс-сборкой на x64);
+   - `macos-universal` — `zip` с `ITMO Labels.app` (arm64 + x86_64) и `labelprobe`,
+     собирается `scripts/macos-app.sh`;
+3. `release` — только для тега `v*`: GitHub Release с этими архивами.
+
+Выпустить версию: `git tag v0.1.0 && git push origin v0.1.0`.
+
+macOS-приложение подписано только ad-hoc, без нотаризации: при первом запуске macOS
+попросит подтвердить открытие (Системные настройки → Конфиденциальность и безопасность →
+«Всё равно открыть»).
