@@ -1,7 +1,11 @@
 //! TSPL/TSPL2 encoder (TSC and the many clones that report `CMD:XPP,XL` or `CMD:TSPL`).
 
 use std::fmt::Write as _;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{io, time::Duration};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::transport::Transport;
 use crate::label::{Bitmap, Element, Font, Label, Rect, Rotation, Text};
 
 #[derive(Debug)]
@@ -113,6 +117,23 @@ pub struct Status(pub u8);
 impl Status {
     pub const QUERY: &'static [u8] = b"\x1b!?";
 
+    /// Sends `QUERY` and waits up to `quiet` for the reply, asking once more if none comes.
+    ///
+    /// Under Windows `usbprint.sys` every other reply goes missing: the driver resets the
+    /// host side of the bulk IN data toggle while the printer keeps its own, so the host
+    /// takes the next packet for a retransmission and drops it. That packet still flips
+    /// the printer's toggle, so the second query's reply gets through.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn query(p: &mut dyn Transport, quiet: Duration) -> io::Result<Option<Self>> {
+        for _ in 0..2 {
+            p.write(Self::QUERY)?;
+            if let Some(&b) = p.read(quiet)?.first() {
+                return Ok(Some(Self(b)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn is_ready(self) -> bool {
         self.0 == 0
     }
@@ -129,5 +150,55 @@ impl Status {
             "other error",
         ];
         BITS.iter().enumerate().filter(|(i, _)| self.0 & (1 << i) != 0).map(|(_, s)| *s).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io, time::Duration};
+
+    use super::Status;
+    use crate::transport::Transport;
+
+    /// Answers each read with the next canned reply; counts writes.
+    struct Fake {
+        replies: VecDeque<Vec<u8>>,
+        writes: usize,
+    }
+
+    impl Transport for Fake {
+        fn write(&mut self, _: &[u8]) -> io::Result<()> {
+            self.writes += 1;
+            Ok(())
+        }
+
+        fn read(&mut self, _: Duration) -> io::Result<Vec<u8>> {
+            Ok(self.replies.pop_front().unwrap_or_default())
+        }
+
+        fn device_id(&mut self) -> io::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn query(replies: &[&[u8]]) -> (Option<u8>, usize) {
+        let mut p = Fake { replies: replies.iter().map(|r| r.to_vec()).collect(), writes: 0 };
+        let s = Status::query(&mut p, Duration::ZERO).unwrap();
+        (s.map(|s| s.0), p.writes)
+    }
+
+    #[test]
+    fn status_first_reply() {
+        assert_eq!(query(&[b"\x00"]), (Some(0), 1));
+    }
+
+    #[test]
+    fn status_dropped_reply_is_asked_again() {
+        assert_eq!(query(&[b"", b"\x04"]), (Some(4), 2));
+    }
+
+    #[test]
+    fn status_no_reply_gives_up_after_retry() {
+        assert_eq!(query(&[]), (None, 2));
     }
 }

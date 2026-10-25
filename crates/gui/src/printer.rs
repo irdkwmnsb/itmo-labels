@@ -257,8 +257,7 @@ mod native {
     }
 
     fn query_status(p: &mut dyn Transport) -> io::Result<Option<tspl::Status>> {
-        p.write(tspl::Status::QUERY)?;
-        Ok(p.read(Duration::from_millis(300))?.first().map(|&b| tspl::Status(b)))
+        tspl::Status::query(p, Duration::from_millis(300))
     }
 
     fn health(found: &[Found], name: &str) -> Health {
