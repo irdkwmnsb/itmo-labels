@@ -97,6 +97,32 @@ pub struct Tr {
     pub this_device: &'static str,
     pub job_sent: &'static str,
     pub kb: &'static str,
+    pub stop: &'static str,
+    /// "Printed 2 of 11".
+    pub printed_n: &'static str,
+    pub of: &'static str,
+    /// "The first 3 printed, the rest failed: …".
+    pub first: &'static str,
+    pub rest_failed: &'static str,
+    /// "Print 51 labels?"
+    pub confirm_print: &'static str,
+    /// One, few, many, picked by `plural`.
+    pub labels: [&'static str; 3],
+    pub plural: fn(u64) -> usize,
+    pub ranges: &'static str,
+    pub total: &'static str,
+    pub from: &'static str,
+    pub to: &'static str,
+    pub step: &'static str,
+    pub product: &'static str,
+    pub product_hint: &'static str,
+    pub zip: &'static str,
+    pub zip_hint: &'static str,
+    pub bad_start: &'static str,
+    pub bad_stop: &'static str,
+    pub bad_step: &'static str,
+    pub zero_step: &'static str,
+    pub wrong_direction: &'static str,
 }
 
 pub const RU: Tr = Tr {
@@ -192,6 +218,28 @@ pub const RU: Tr = Tr {
     this_device: "это устройство",
     job_sent: "отправлено",
     kb: "КБ",
+    stop: "Стоп",
+    printed_n: "Напечатано",
+    of: "из",
+    first: "Первые",
+    rest_failed: "напечатаны, остальные не напечатались:",
+    confirm_print: "Напечатать",
+    labels: ["этикетку", "этикетки", "этикеток"],
+    plural: ru_plural,
+    ranges: "Диапазоны",
+    total: "Всего:",
+    from: "от",
+    to: "до",
+    step: "шаг",
+    product: "Все сочетания",
+    product_hint: "Каждое значение с каждым: первое имя меняется медленнее всех",
+    zip: "Попарно",
+    zip_hint: "Первые значения вместе, вторые вместе… — пока не кончится самый короткий",
+    bad_start: "Начало — целое число от 0",
+    bad_stop: "Конец — целое число от 0",
+    bad_step: "Шаг — целое число, со знаком минус для обратного счёта",
+    zero_step: "Шаг не может быть 0",
+    wrong_direction: "С таким шагом до конца не дойти: смените знак",
 };
 
 pub const EN: Tr = Tr {
@@ -287,7 +335,48 @@ pub const EN: Tr = Tr {
     this_device: "this device",
     job_sent: "sent",
     kb: "KB",
+    stop: "Stop",
+    printed_n: "Printed",
+    of: "of",
+    first: "The first",
+    rest_failed: "printed, the rest failed:",
+    confirm_print: "Print",
+    labels: ["label", "labels", "labels"],
+    plural: en_plural,
+    ranges: "Ranges",
+    total: "Total:",
+    from: "from",
+    to: "to",
+    step: "step",
+    product: "Every combination",
+    product_hint: "Each value with each: the first name changes slowest",
+    zip: "Side by side",
+    zip_hint: "First values together, then second… until the shortest range ends",
+    bad_start: "Start must be a whole number, 0 or more",
+    bad_stop: "Stop must be a whole number, 0 or more",
+    bad_step: "Step must be a whole number, negative to count down",
+    zero_step: "Step cannot be 0",
+    wrong_direction: "This step never reaches the stop: flip its sign",
 };
+
+fn ru_plural(n: u64) -> usize {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => 0,
+        (2..=4, r) if !(12..=14).contains(&r) => 1,
+        _ => 2,
+    }
+}
+
+fn en_plural(n: u64) -> usize {
+    if n == 1 { 0 } else { 1 }
+}
+
+impl Tr {
+    /// "labels" agreeing with `n`.
+    pub fn labels(&self, n: u64) -> &'static str {
+        self.labels[(self.plural)(n)]
+    }
+}
 
 pub fn tr(lang: Lang) -> &'static Tr {
     match lang {

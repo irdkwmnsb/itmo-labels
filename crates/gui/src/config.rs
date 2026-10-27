@@ -18,6 +18,8 @@ use std::{
 use itmo_labels_core::render::{Align, Fit};
 use serde::{Deserialize, Serialize};
 
+use crate::ranges::{Mode, Range};
+
 const DEFAULT_SIZES: &str = r#"# Label sizes for ITMO Labels. This file is re-read as soon as it is saved.
 #
 # width_mm  — across the print head (the edge that comes out of the printer first)
@@ -456,8 +458,12 @@ impl Lang {
 #[serde(default)]
 pub struct TemplateState {
     pub orientation: Option<Orientation>,
+    /// How the ranges combine when there are several.
+    pub mode: Mode,
     /// Field name → text.
     pub fields: BTreeMap<String, String>,
+    /// Placeholder name → its range; kept while the name is gone from the texts.
+    pub ranges: BTreeMap<String, Range>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -604,7 +610,9 @@ mod tests {
         let mut s = State { template: Some("Badge".into()), lang: Some(Lang::Ru), ..State::default() };
         let badge = s.templates.entry("Badge".into()).or_default();
         badge.orientation = Some(Orientation::Landscape);
-        badge.fields.insert("Name".into(), "Иван \"Ваня\" Иванов".into());
+        badge.fields.insert("Name".into(), "Иван \"Ваня\" Иванов {n}".into());
+        badge.mode = Mode::Zip;
+        badge.ranges.insert("n".into(), Range { start: "007".into(), stop: "010".into(), step: "-".into() });
         assert_eq!(toml::from_str::<State>(&toml::to_string(&s).unwrap()).unwrap(), s);
     }
 
