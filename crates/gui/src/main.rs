@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod batch;
 mod config;
 #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 mod debug;
@@ -12,6 +13,7 @@ mod editor;
 mod i18n;
 mod printer;
 mod query;
+mod ranges;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
