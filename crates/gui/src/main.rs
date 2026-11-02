@@ -53,6 +53,14 @@ fn main() -> eframe::Result {
     )
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn should_prevent_default(event: &egui::Event) -> bool {
+    !matches!(
+        event,
+        egui::Event::PointerButton { .. } | egui::Event::PointerMoved(_) | egui::Event::PointerGone
+    )
+}
+
 /// Started by `index.html`; draws into its `<canvas id="app">`.
 #[cfg(target_arch = "wasm32")]
 fn main() {
@@ -64,10 +72,17 @@ fn main() {
             .get_element_by_id("app")
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .expect("index.html has a canvas#app");
+        // Taps keep their default action: mobile browsers open the keyboard on a tap that ends
+        // on a focused text field, and prevented touch events are no tap. Even a slight touchmove
+        // must keep its default action. Scrolling and zooming are off in index.html instead.
+        let options = eframe::WebOptions {
+            should_prevent_default: Box::new(should_prevent_default),
+            ..Default::default()
+        };
         let started = eframe::WebRunner::new()
             .start(
                 canvas,
-                eframe::WebOptions::default(),
+                options,
                 Box::new(|cc| {
                     install_fonts(&cc.egui_ctx);
                     Ok(Box::new(app::App::new(&cc.egui_ctx)))
@@ -81,4 +96,23 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_pointer_events_keep_default_browser_actions() {
+        assert!(!should_prevent_default(&egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        assert!(!should_prevent_default(&egui::Event::PointerMoved(
+            egui::Pos2::ZERO
+        )));
+        assert!(!should_prevent_default(&egui::Event::PointerGone));
+    }
 }
