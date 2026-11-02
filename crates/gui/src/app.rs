@@ -392,7 +392,8 @@ impl App {
             (None, true) => t.no_printers,
             (None, false) => t.choose_printer,
         };
-        ComboBox::from_id_salt("printer").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
+        let combo = ComboBox::from_id_salt("printer").width(ui.available_width()).truncate().selected_text(shown);
+        let combo = combo.show_ui(ui, |ui| {
             for name in &printers {
                 if ui.selectable_label(current.as_deref() == Some(name), name).clicked() {
                     self.state.printer = Some(name.clone());
@@ -400,6 +401,9 @@ impl App {
                 }
             }
         });
+        if let Some(name) = &current {
+            combo.response.on_hover_text(name);
+        }
         if current.is_some() {
             status_line(ui, t, &self.snapshot);
         }
@@ -730,7 +734,7 @@ fn list_picker(
         }
     });
     let mut picked = None;
-    ComboBox::from_id_salt(id).width(ui.available_width()).selected_text(selected).show_ui(ui, |ui| {
+    ComboBox::from_id_salt(id).width(ui.available_width()).truncate().selected_text(selected).show_ui(ui, |ui| {
         for item in items {
             if ui.selectable_label(item == selected, item).clicked() {
                 picked = Some(item.clone());
