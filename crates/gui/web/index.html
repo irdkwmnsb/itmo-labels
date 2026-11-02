@@ -17,9 +17,6 @@
   <div id="loading">Loading…</div>
   <script type="module">
     import init from "./itmo-labels.js";
-    // A tap now ends in mousedown on the canvas, whose default action would move the focus
-    // from the app's hidden text input back to the canvas and close the keyboard again.
-    document.getElementById("app").addEventListener("mousedown", (e) => e.preventDefault());
     init().catch((e) => { document.getElementById("loading").textContent = "Failed to start: " + e; });
   </script>
 </body>
