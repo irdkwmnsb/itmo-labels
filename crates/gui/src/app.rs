@@ -1,7 +1,12 @@
-use std::{collections::BTreeMap, ops::Range, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ops::Range,
+    path::Path,
+    process::Command,
+};
 
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, RichText, Stroke, TextEdit,
+    self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Layout, Panel, Pos2, RichText, Stroke, TextEdit,
     TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, ViewportCommand,
 };
 use web_time::{Duration, Instant};
@@ -17,6 +22,7 @@ use crate::{
     config::{self, Lang, Orientation, Size, Source, State, Template},
     editor::{self, Editor},
     i18n::{Tr, tr},
+    picture::Settings,
     printer::{Health, Printers, Snapshot},
     ranges::{self, Mode, Series},
 };
@@ -73,6 +79,7 @@ impl RenderKey {
                 wrap: f.wrap,
             })
             .collect();
+        let pictures: Vec<_> = self.template.pictures.iter().map(config::Picture::core).collect();
         render::render(&LabelSpec {
             width_mm: self.size.width_mm,
             height_mm: self.size.height_mm,
@@ -83,14 +90,62 @@ impl RenderKey {
                 Orientation::Landscape => RenderOrientation::Landscape,
             },
             fields: &fields,
+            pictures: &pictures,
         })
     }
 }
 
+/// White paper, black dots: a preview of a 1-bit bitmap.
+fn bitmap_image(b: &Bitmap) -> ColorImage {
+    let (w, h) = (b.width_px as usize, b.height_px as usize);
+    let mut gray = Vec::with_capacity(w * h);
+    for row in b.data.chunks(b.row_bytes()) {
+        for x in 0..w {
+            gray.push(if row[x / 8] & (0x80 >> (x % 8)) == 0 { 255 } else { 0 });
+        }
+    }
+    ColorImage::from_gray([w, h], &gray)
+}
+
 pub fn texture(ctx: &egui::Context, name: &str, b: &Bitmap) -> TextureHandle {
-    let pixels = (0..b.height_px).flat_map(|y| (0..b.width_px).map(move |x| if b.get(x, y) { 0 } else { 255 }));
-    let image = ColorImage::from_gray_iter([b.width_px as usize, b.height_px as usize], pixels);
-    ctx.load_texture(name, image, TextureOptions::LINEAR)
+    ctx.load_texture(name, bitmap_image(b), TextureOptions::LINEAR)
+}
+
+/// The live bitmap of a picture still being placed, drawn over the cached label render.
+pub struct PendingTexture {
+    pub texture: TextureHandle,
+    version: (Settings, usize),
+}
+
+/// Whether the cached texture for `key` already shows `version`.
+pub fn pending_fresh(
+    cache: &HashMap<(String, usize), PendingTexture>,
+    key: &(String, usize),
+    version: &(Settings, usize),
+) -> bool {
+    cache.get(key).is_some_and(|p| p.version == *version)
+}
+
+/// Creates the texture for `key`, or overwrites it in place when the bitmap changed:
+/// no new GPU texture per frame, just an upload.
+pub fn pending_update(
+    ctx: &egui::Context,
+    cache: &mut HashMap<(String, usize), PendingTexture>,
+    key: (String, usize),
+    version: (Settings, usize),
+    bitmap: &Bitmap,
+) {
+    let image = bitmap_image(bitmap);
+    match cache.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let p = e.get_mut();
+            p.texture.set(image, TextureOptions::LINEAR);
+            p.version = version;
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(PendingTexture { texture: ctx.load_texture("pending-picture", image, TextureOptions::LINEAR), version });
+        }
+    }
 }
 
 /// The label centred on a grey backdrop filling `area`; returns where the label landed.
@@ -173,6 +228,8 @@ pub struct App {
     run: Option<Run>,
     /// A long series waiting for "yes": its length.
     confirm: Option<u64>,
+    /// Live bitmaps of pictures still being placed: (template, index) → texture.
+    picture_textures: HashMap<(String, usize), PendingTexture>,
     fonts: Fonts,
     editor: Editor,
     #[cfg(not(target_arch = "wasm32"))]
@@ -204,6 +261,7 @@ impl App {
             shown: 0,
             run: None,
             confirm: None,
+            picture_textures: HashMap::new(),
             fonts: Fonts::embedded(),
             editor: Editor::default(),
             #[cfg(debug_assertions)]
@@ -227,6 +285,7 @@ impl App {
             shown: 0,
             run: None,
             confirm: None,
+            picture_textures: HashMap::new(),
             fonts: Fonts::embedded(),
             editor: Editor::default(),
         }
@@ -273,7 +332,10 @@ impl App {
 
     /// With the texts as typed, placeholders included.
     fn base_key(&self) -> Option<RenderKey> {
-        let template = self.selected_template()?.clone();
+        // Pictures still being placed are drawn over the preview live; they must not
+        // churn the render cache while they are scaled.
+        let mut template = self.selected_template()?.clone();
+        template.pictures.retain(|p| p.pending.is_none());
         Some(RenderKey {
             size: self.selected_size()?.clone(),
             orientation: self.orientation(&template),
@@ -478,11 +540,13 @@ impl App {
         }
         ui.add_space(12.0);
 
-        let has_text = self.texts(&template).iter().any(|s| !s.trim().is_empty());
+        let has_ink = !template.pictures.is_empty() || self.texts(&template).iter().any(|s| !s.trim().is_empty());
+        // Unbaked pictures are not in the render yet: nothing should print until they are baked.
+        let unbaked = template.pictures.iter().any(|p| p.pending.is_some());
         let running = self.running();
         let count = self.series.as_ref().map(|s| s.count);
         let ready = self.snapshot.health == Some(Health::Ready) && !self.snapshot.busy_printing && !running;
-        let can_print = ready && has_text && self.rendered.is_some() && count.is_some();
+        let can_print = ready && has_ink && !unbaked && self.rendered.is_some() && count.is_some();
         let current = self.run.as_ref().and_then(|r| r.batch.current().map(|labels| (labels, r.batch.total)));
         let label = match (current, count) {
             (Some((labels, total)), _) if labels.end - labels.start > 1 => {
@@ -634,15 +698,41 @@ impl App {
     /// Fills `area`, or with `None` the rest of the panel; a series gets arrows under the label.
     fn preview(&mut self, ui: &mut Ui, area: Option<egui::Rect>) {
         let Some((_, r, texture)) = &self.rendered else { return };
-        let size = Vec2::new(r.preview.width_px as f32, r.preview.height_px as f32);
+        let (pw, ph) = (r.preview.width_px, r.preview.height_px);
+        let size = Vec2::new(pw as f32, ph as f32);
         let area = area.unwrap_or_else(|| ui.available_rect_before_wrap());
         let count = self.count();
+        if count > 1 {
+            ui.painter().rect_filled(area, 0.0, Color32::from_gray(200));
+        }
+        let label_area = if count <= 1 { area } else { area.with_max_y(area.max.y - STEPPER) };
+        let label = paint_label(ui, label_area, texture, size);
+        // Pictures still being placed are drawn here, live, instead of inside the cached render.
+        if let Some(template) = self.selected_template().cloned() {
+            let mut live = HashSet::new();
+            for (i, p) in template.pictures.iter().enumerate() {
+                let Some(pending) = &p.pending else { continue };
+                let key = (template.name.clone(), i);
+                let version = pending.version();
+                if !pending_fresh(&self.picture_textures, &key, &version) {
+                    pending_update(ui.ctx(), &mut self.picture_textures, key.clone(), version, &p.bitmap);
+                }
+                let tex = self.picture_textures[&key].texture.id();
+                let (x, y) = p.core().origin(pw, ph);
+                let scale = label.width() / pw as f32;
+                let rect = egui::Rect::from_min_size(
+                    label.min + Vec2::new(x as f32, y as f32) * scale,
+                    Vec2::new(p.bitmap.width_px as f32, p.bitmap.height_px as f32) * scale,
+                );
+                let uv = egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                ui.painter().image(tex, rect, uv, Color32::WHITE);
+                live.insert(key);
+            }
+            self.picture_textures.retain(|k, _| live.contains(k));
+        }
         if count <= 1 {
-            paint_label(ui, area, texture, size);
             return;
         }
-        ui.painter().rect_filled(area, 0.0, Color32::from_gray(200));
-        paint_label(ui, area.with_max_y(area.max.y - STEPPER), texture, size);
         let bar = egui::Rect::from_center_size(
             egui::pos2(area.center().x, area.max.y - STEPPER / 2.0 - 4.0),
             Vec2::new(200.0, 28.0),

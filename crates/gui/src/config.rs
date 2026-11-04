@@ -15,9 +15,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use itmo_labels_core::render::{Align, Fit};
+use itmo_labels_core::{
+    label::Bitmap,
+    render::{self, Align, Fit},
+};
 use serde::{Deserialize, Serialize};
 
+use crate::picture::{self, Pending};
 use crate::ranges::{Mode, Range};
 
 const DEFAULT_SIZES: &str = r#"# Label sizes for ITMO Labels. This file is re-read as soon as it is saved.
@@ -76,6 +80,15 @@ const TEMPLATES_HEADER: &str = r#"# Label templates for ITMO Labels. This file i
 # wrap   — true: break the text into lines at spaces when that makes it larger; false (default):
 #          always one line
 # sample — optional example text: the editor previews it, the input box shows it greyed out
+#
+# [[template.picture]] — a 1-bit image, printed dot for dot: the same size on every label
+# x, y          — where its anchor point goes, as fractions (0..1) of the whole label
+#                 (margins do not apply; whatever is past the label's edge is cut off)
+# anchor        — which point of the picture that is: "top-left", "top", "top-right", "left",
+#                 "center", "right", "bottom-left", "bottom", "bottom-right"
+# anchor_locked — true: the editor keeps this anchor; false (default): it picks the nearest one
+#                 when the picture is moved
+# png           — the dots as a base64 PNG, one pixel per dot at 203 dpi
 "#;
 
 const DEFAULT_TEMPLATES: &str = r#"[[template]]
@@ -311,6 +324,103 @@ fn rounded_opt<S: serde::Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::
     }
 }
 
+/// The point of a picture that stays put when the label size changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Anchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    #[default]
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Anchor {
+    /// Row by row, as on a 3×3 grid.
+    pub const ALL: [Self; 9] = [
+        Self::TopLeft,
+        Self::Top,
+        Self::TopRight,
+        Self::Left,
+        Self::Center,
+        Self::Right,
+        Self::BottomLeft,
+        Self::Bottom,
+        Self::BottomRight,
+    ];
+
+    /// As fractions of the picture's size: 0, 0.5 or 1 along each axis.
+    pub fn fractions(self) -> (f32, f32) {
+        let i = Self::ALL.iter().position(|&a| a == self).expect("listed");
+        ((i % 3) as f32 / 2.0, (i / 3) as f32 / 2.0)
+    }
+
+    /// The anchor for a picture centred at (x, y): by which third of the label that falls in.
+    pub fn nearest(x: f32, y: f32) -> Self {
+        let third = |v: f32| (v * 3.0).floor().clamp(0.0, 2.0) as usize;
+        Self::ALL[third(y) * 3 + third(x)]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Picture {
+    #[serde(serialize_with = "rounded")]
+    pub x: f32,
+    #[serde(serialize_with = "rounded")]
+    pub y: f32,
+    pub anchor: Anchor,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub anchor_locked: bool,
+    #[serde(rename = "png", with = "picture::base64_png")]
+    pub bitmap: Bitmap,
+    /// Editor only: still being placed, and `bitmap` shows what baking it now would give.
+    #[serde(skip)]
+    pub pending: Option<Pending>,
+}
+
+impl Picture {
+    pub fn core(&self) -> render::Picture<'_> {
+        render::Picture { bitmap: &self.bitmap, at: (self.x, self.y), anchor: self.anchor.fractions() }
+    }
+
+    /// Converts the source again if its settings changed since `bitmap` was made.
+    /// The conversion runs off the UI thread on desktop, so a dragged slider or corner
+    /// stays smooth even for a large dither; on the web it is rate-limited instead.
+    pub fn refresh(&mut self) {
+        if let Some(p) = &mut self.pending
+            && let Some(bitmap) = p.refresh()
+        {
+            self.bitmap = bitmap;
+        }
+    }
+
+    /// Converts right now if the settings changed: pointer up, rotation, baking.
+    pub fn refresh_now(&mut self) {
+        if let Some(p) = &mut self.pending
+            && let Some(bitmap) = p.refresh_now()
+        {
+            self.bitmap = bitmap;
+        }
+    }
+
+    /// Its size in dots as intended right now: the live settings while pending, the bitmap once baked.
+    pub fn intended_size(&self) -> (u32, u32) {
+        match &self.pending {
+            Some(p) => {
+                let w = p.settings.width_px.max(1);
+                (w, p.source.height_for(w))
+            }
+            None => (self.bitmap.width_px, self.bitmap.height_px),
+        }
+    }
+}
+
 /// Defaults are left out when written, so a saved file reads like a hand-written one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -364,6 +474,8 @@ pub struct Template {
     pub orientation: Option<Orientation>,
     #[serde(default, rename = "field")]
     pub fields: Vec<Field>,
+    #[serde(default, rename = "picture", skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<Picture>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -403,6 +515,15 @@ fn validate_templates(templates: &[Template]) -> Result<(), String> {
                 return Err(format!("template \"{}\": field \"{}\" is defined twice", t.name, f.name));
             }
             validate_field(f).map_err(|e| format!("template \"{}\": {e}", t.name))?;
+        }
+        for (i, p) in t.pictures.iter().enumerate() {
+            // The anchor may sit off the label — a picture is allowed to hang off the edge.
+            if !(-10.0..=11.0).contains(&p.x) || !(-10.0..=11.0).contains(&p.y) {
+                return Err(format!("template \"{}\": picture {}: x, y must be fractions of the label", t.name, i + 1));
+            }
+            if p.pending.is_some() {
+                return Err(format!("template \"{}\": picture {} is not baked yet", t.name, i + 1));
+            }
         }
     }
     Ok(())
@@ -590,6 +711,49 @@ mod tests {
         let mut back = parse_templates(&text).unwrap();
         back[1].fields[1].x = templates[1].fields[1].x;
         assert_eq!(back, templates);
+    }
+
+    fn logo() -> Picture {
+        Picture {
+            x: 1.0,
+            y: 0.0,
+            anchor: Anchor::TopRight,
+            anchor_locked: true,
+            bitmap: Bitmap::from_fn(0.0, 0.0, 21, 9, |x, y| x == y),
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn pictures_read_back_dot_for_dot() {
+        let mut templates = builtin_templates();
+        templates[1].pictures.push(logo());
+        templates[1].pictures.push(Picture { anchor_locked: false, anchor: Anchor::Center, x: 0.5, y: 0.5, ..logo() });
+        let text = format_templates(&templates).unwrap();
+        assert!(text.contains("[[template.picture]]") && text.contains("anchor = \"top-right\""), "{text}");
+        assert_eq!(text.matches("anchor_locked = true").count(), 1, "default left out:\n{text}");
+        assert_eq!(parse_templates(&text).unwrap(), templates);
+        assert!(!format_templates(&builtin_templates()).unwrap().contains("\n[[template.picture]]"), "no pictures, no section");
+    }
+
+    #[test]
+    fn broken_pictures_are_rejected() {
+        let mut templates = builtin_templates();
+        templates[0].pictures.push(logo());
+        let good = format_templates(&templates).unwrap();
+        assert!(parse_templates(&good.replace("x = 1.0", "x = 42.0")).is_err(), "anchor point far off the label");
+        assert!(parse_templates(&good.replace("anchor = \"top-right\"", "anchor = \"middle\"")).is_err());
+        let png = good.lines().find(|l| l.starts_with("png = ")).unwrap();
+        assert!(parse_templates(&good.replace(png, "png = \"bm90IGEgcG5n\"")).is_err(), "not a PNG");
+    }
+
+    #[test]
+    fn anchors_by_thirds() {
+        assert_eq!(Anchor::nearest(0.1, 0.9), Anchor::BottomLeft);
+        assert_eq!(Anchor::nearest(0.5, 0.5), Anchor::Center);
+        assert_eq!(Anchor::nearest(1.0, 0.0), Anchor::TopRight);
+        assert_eq!(Anchor::BottomRight.fractions(), (1.0, 1.0));
+        assert_eq!(Anchor::Top.fractions(), (0.5, 0.0));
     }
 
     #[test]

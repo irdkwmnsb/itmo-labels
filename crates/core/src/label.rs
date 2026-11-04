@@ -56,7 +56,7 @@ pub struct Rect {
 
 /// 1 bit per pixel, rows padded to whole bytes, MSB is the leftmost pixel, 1 = black.
 /// Pixels map 1:1 to printer dots.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bitmap {
     pub x_mm: f32,
     pub y_mm: f32,

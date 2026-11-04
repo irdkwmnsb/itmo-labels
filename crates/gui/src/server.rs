@@ -32,7 +32,8 @@ use crate::{
 
 const MAX_HEAD: usize = 16 << 10;
 const MAX_JOB: usize = 16 << 20;
-const MAX_TEMPLATES: usize = 1 << 20;
+/// Pictures are stored inside `templates.toml`, so it can grow well past a page of text.
+const MAX_TEMPLATES: usize = 16 << 20;
 /// A client that stalls mid-request this long is dropped.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
