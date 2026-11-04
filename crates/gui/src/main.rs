@@ -11,6 +11,7 @@ mod config;
 mod debug;
 mod editor;
 mod i18n;
+mod picture;
 mod printer;
 mod query;
 mod ranges;

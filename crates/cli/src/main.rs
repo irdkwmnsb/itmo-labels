@@ -171,6 +171,7 @@ fn run(args: &[String]) -> Result<()> {
                 dpi: 203,
                 orientation,
                 fields: &fields,
+                pictures: &[],
             });
             let out = arg(4, "output")?;
             // PBM P4 rows are 1 bpp, MSB first, 1 = black: exactly our Bitmap layout.

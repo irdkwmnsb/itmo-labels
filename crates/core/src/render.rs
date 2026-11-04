@@ -2,7 +2,7 @@
 //! bitmap in printer dots, so labels do not depend on the printer's built-in fonts.
 //!
 //! A label is a set of text fields, each auto-sized independently into its own zone,
-//! on one line or word-wrapped onto several.
+//! on one line or word-wrapped onto several, plus pictures of a fixed size in dots.
 
 use ab_glyph::{Font, FontRef, Glyph, PxScale, Rect, ScaleFont, point};
 
@@ -66,6 +66,26 @@ pub struct TextField<'a> {
     pub wrap: bool,
 }
 
+/// A ready 1-bit image, drawn dot for dot whatever the label size; anything past the
+/// label's edge is cut off. Margins do not apply.
+pub struct Picture<'a> {
+    /// In reading orientation; its own `x_mm`, `y_mm` are not used.
+    pub bitmap: &'a Bitmap,
+    /// Where the anchor point goes, as fractions of the whole label in reading orientation.
+    pub at: (f32, f32),
+    /// The anchor point, as fractions of the picture's own size: 0, 0.5 or 1 along each axis.
+    pub anchor: (f32, f32),
+}
+
+impl Picture<'_> {
+    /// Top-left pixel of the picture on a `w`×`h` canvas; may be outside it.
+    pub fn origin(&self, w: u32, h: u32) -> (i64, i64) {
+        let x = self.at.0 * w as f32 - self.anchor.0 * self.bitmap.width_px as f32;
+        let y = self.at.1 * h as f32 - self.anchor.1 * self.bitmap.height_px as f32;
+        (x.round() as i64, y.round() as i64)
+    }
+}
+
 pub struct LabelSpec<'a> {
     /// Across the print head.
     pub width_mm: f32,
@@ -75,6 +95,7 @@ pub struct LabelSpec<'a> {
     pub dpi: u32,
     pub orientation: Orientation,
     pub fields: &'a [TextField<'a>],
+    pub pictures: &'a [Picture<'a>],
 }
 
 pub struct Rendered {
@@ -245,6 +266,24 @@ fn draw_field(canvas: &mut Bitmap, field: &TextField, zone: Rect, dpi: u32) -> O
     Some(block.scale / per_pt)
 }
 
+fn draw_picture(canvas: &mut Bitmap, picture: &Picture) {
+    let (w, h) = (canvas.width_px, canvas.height_px);
+    let (ox, oy) = picture.origin(w, h);
+    let b = picture.bitmap;
+    for y in 0..b.height_px {
+        let cy = oy + y as i64;
+        if cy < 0 || cy >= h as i64 {
+            continue;
+        }
+        for x in 0..b.width_px {
+            let cx = ox + x as i64;
+            if cx >= 0 && cx < w as i64 && b.get(x, y) {
+                canvas.set(cx as u32, cy as u32);
+            }
+        }
+    }
+}
+
 pub fn render(spec: &LabelSpec) -> Rendered {
     let (across, along) = (dots(spec.width_mm, spec.dpi), dots(spec.height_mm, spec.dpi));
     // Lines run across the head unless the chosen orientation wants the other side.
@@ -258,6 +297,9 @@ pub fn render(spec: &LabelSpec) -> Rendered {
     let (content_w, content_h) = ((w as f32 - 2.0 * margin).max(1.0), (h as f32 - 2.0 * margin).max(1.0));
 
     let mut canvas = Bitmap::blank(0.0, 0.0, w, h);
+    for picture in spec.pictures {
+        draw_picture(&mut canvas, picture);
+    }
     let sizes_pt = spec
         .fields
         .iter()
@@ -294,7 +336,7 @@ mod tests {
     }
 
     fn spec<'a>(fields: &'a [TextField<'a>], w: f32, h: f32, orientation: Orientation) -> LabelSpec<'a> {
-        LabelSpec { width_mm: w, height_mm: h, gap_mm: 2.0, dpi: 203, orientation, fields }
+        LabelSpec { width_mm: w, height_mm: h, gap_mm: 2.0, dpi: 203, orientation, fields, pictures: &[] }
     }
 
     fn printed(r: &Rendered) -> &Bitmap {
@@ -472,6 +514,36 @@ mod tests {
                 assert!((lx0 - m).abs_diff(r.preview.width_px - m - 1 - lx1) <= 2, "{fit:?} line not centred");
             }
         }
+    }
+
+    #[test]
+    fn picture_keeps_its_size_and_corner_on_any_label() {
+        let logo = Bitmap::from_fn(0.0, 0.0, 40, 24, |_, _| true);
+        let corner = [Picture { bitmap: &logo, at: (1.0, 1.0), anchor: (1.0, 1.0) }];
+        for (w, h) in [(50.0, 70.0), (30.0, 20.0)] {
+            let r = render(&LabelSpec { pictures: &corner, ..spec(&[], w, h, Orientation::Portrait) });
+            let (pw, ph) = (r.preview.width_px, r.preview.height_px);
+            assert_eq!(ink_box(&r.preview, 0..u32::MAX), Some((pw - 40, ph - 24, pw - 1, ph - 1)), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn picture_past_the_edge_is_cut_off() {
+        let logo = Bitmap::from_fn(0.0, 0.0, 40, 24, |_, _| true);
+        let centred_on_corner = [Picture { bitmap: &logo, at: (0.0, 0.0), anchor: (0.5, 0.5) }];
+        let r = render(&LabelSpec { pictures: &centred_on_corner, ..spec(&[], 50.0, 70.0, Orientation::Portrait) });
+        assert_eq!(ink_box(&r.preview, 0..u32::MAX), Some((0, 0, 19, 11)));
+    }
+
+    #[test]
+    fn picture_turns_with_the_text() {
+        let mut logo = Bitmap::blank(0.0, 0.0, 8, 8);
+        logo.set(0, 0);
+        let top_left = [Picture { bitmap: &logo, at: (0.0, 0.0), anchor: (0.0, 0.0) }];
+        let r = render(&LabelSpec { pictures: &top_left, ..spec(&[], 50.0, 70.0, Orientation::Landscape) });
+        assert!(r.preview.get(0, 0), "top-left as read");
+        let printed = printed(&r);
+        assert!(printed.get(printed.width_px - 1, 0), "top-right as printed");
     }
 
     #[test]

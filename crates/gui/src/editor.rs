@@ -1,7 +1,10 @@
 //! Template editor: a window of its own that edits a draft of the whole `templates.toml`.
 //! The main window renders the draft as it changes; the file is only written on Save.
 
-use std::{collections::HashMap, mem};
+use std::{
+    collections::{HashMap, HashSet},
+    mem,
+};
 
 use eframe::egui::{
     self, Align2, Button, CentralPanel, Color32, ComboBox, CursorIcon, DragValue, FontId, Grid, Id, Key,
@@ -11,9 +14,10 @@ use eframe::egui::{
 use itmo_labels_core::render::{MARGIN_MM, Rendered};
 
 use crate::{
-    app::{self, DPI, Fonts, RenderKey},
-    config::{Field, FieldAlign, FieldFit, Orientation, Size, Template, TemplatesWriter},
+    app::{self, DPI, Fonts, RenderKey, pending_fresh, pending_update},
+    config::{Anchor, Field, FieldAlign, FieldFit, Orientation, Picture, Size, Template, TemplatesWriter},
     i18n::Tr,
+    picture::{FilePicker, Mode, Pending, Settings, Source},
 };
 
 /// Zones snap to multiples of this when no other edge is near.
@@ -27,6 +31,10 @@ const UNDO_LIMIT: usize = 100;
 const NUDGE: f32 = 0.01;
 const NUDGE_FAR: f32 = 0.1;
 const ACCENT: Color32 = Color32::from_rgb(0x2f, 0x81, 0xf7);
+/// Frames of pictures that are not baked yet.
+const PENDING: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
+/// Narrowest picture, in dots (1 mm).
+const MIN_PICTURE_PX: u32 = 8;
 
 pub fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("template-editor")
@@ -186,6 +194,69 @@ fn free_band(fields: &[Field]) -> Edges {
     Edges { l: 0.0, t, r: 1.0, b }
 }
 
+fn px_to_mm(px: u32) -> f32 {
+    px as f32 * 25.4 / DPI as f32
+}
+
+fn mm_to_px(mm: f32) -> u32 {
+    (mm * DPI as f32 / 25.4).round().max(MIN_PICTURE_PX as f32) as u32
+}
+
+/// A picture's box on a label of `label` dots, in fractions of the label.
+fn picture_box(p: &Picture, label: Vec2) -> Edges {
+    let (x, y) = p.core().origin(label.x as u32, label.y as u32);
+    let (x, y) = (x as f32, y as f32);
+    let (w, h) = p.intended_size();
+    let (w, h) = (w as f32, h as f32);
+    Edges { l: x / label.x, t: y / label.y, r: (x + w) / label.x, b: (y + h) / label.y }
+}
+
+/// Puts the picture's top-left corner at (l, t), in fractions of the label, picking the
+/// anchor anew unless it is locked; the anchor point itself stays on the label.
+fn place(p: &mut Picture, l: f32, t: f32, label: Vec2) {
+    if label.x < 1.0 || label.y < 1.0 {
+        return;
+    }
+    let (w, h) = p.intended_size();
+    let (w, h) = (w as f32 / label.x, h as f32 / label.y);
+    if !p.anchor_locked {
+        p.anchor = Anchor::nearest(l + w / 2.0, t + h / 2.0);
+    }
+    let (ax, ay) = p.anchor.fractions();
+    p.x = (l + ax * w).clamp(0.0, 1.0);
+    p.y = (t + ay * h).clamp(0.0, 1.0);
+}
+
+/// Resizes a picture being placed by its corner, keeping the opposite corner of `start` still.
+/// The bitmap itself catches up on the next refresh tick (conversion is rate-limited while
+/// dragging); the box follows the pointer by the intended size, so there is no visible lag.
+fn resize_picture(p: &mut Picture, start: Edges, right: bool, bottom: bool, pointer: Pos2, label: Vec2) {
+    let fixed = Pos2::new(if right { start.l } else { start.r }, if bottom { start.t } else { start.b });
+    {
+        let Some(pending) = &mut p.pending else { return };
+        let (sw, sh) = pending.source.size();
+        let by_x = (pointer.x - fixed.x).abs() * label.x;
+        let by_y = (pointer.y - fixed.y).abs() * label.y * sw as f32 / sh as f32;
+        pending.settings.width_px = (by_x.max(by_y).round() as u32).max(MIN_PICTURE_PX);
+    }
+    let (w, h) = p.intended_size();
+    let (w, h) = (w as f32 / label.x, h as f32 / label.y);
+    let l = if right { fixed.x } else { fixed.x - w };
+    let t = if bottom { fixed.y } else { fixed.y - h };
+    place(p, l, t, label);
+}
+
+/// Turns the picture a quarter clockwise around its anchor point.
+fn rotate_picture(p: &mut Picture) {
+    match &mut p.pending {
+        Some(pending) => {
+            pending.rotate();
+            p.refresh_now();
+        }
+        None => p.bitmap = p.bitmap.rotated_cw(),
+    }
+}
+
 /// `base`, or `base 2`, `base 3`… whichever is free.
 fn unique_name(base: &str, taken: &[&str]) -> String {
     (1..)
@@ -220,6 +291,8 @@ fn name_problems<'a>(names: impl Iterator<Item = &'a str> + Clone) -> Vec<Option
 struct Problems {
     templates: HashMap<u64, Problem>,
     fields: HashMap<(u64, usize), Problem>,
+    /// Templates with pictures not baked yet: they cannot be saved, but the main window shows them.
+    pending: HashSet<u64>,
 }
 
 impl Problems {
@@ -228,6 +301,9 @@ impl Problems {
         for (e, problem) in draft.iter().zip(name_problems(draft.iter().map(|e| e.template.name.as_str()))) {
             if let Some(problem) = problem {
                 p.templates.insert(e.id, problem);
+            }
+            if e.template.pictures.iter().any(|p| p.pending.is_some()) {
+                p.pending.insert(e.id);
             }
             let fields = name_problems(e.template.fields.iter().map(|f| f.name.as_str()));
             for (i, problem) in fields.into_iter().enumerate() {
@@ -239,20 +315,45 @@ impl Problems {
         p
     }
 
+    /// No naming errors; unbaked pictures do not count.
     fn is_empty(&self) -> bool {
         self.templates.is_empty() && self.fields.is_empty()
     }
+
+    fn blocks_save(&self) -> bool {
+        !self.is_empty() || !self.pending.is_empty()
+    }
+
+    /// Why the draft cannot be saved, if it cannot.
+    fn blocker<'t>(&self, t: &'t Tr) -> Option<&'t str> {
+        if !self.is_empty() {
+            Some(t.fix_errors)
+        } else if !self.pending.is_empty() {
+            Some(t.bake_first)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PictureGrab {
+    Move,
+    /// Which corner follows the pointer; only while the picture is being placed.
+    Corner { right: bool, bottom: bool },
 }
 
 enum DragKind {
     Zone { field: usize, grab: Grab },
     Create,
+    Picture { picture: usize, grab: PictureGrab },
 }
 
 struct Drag {
     kind: DragKind,
+    /// In fractions of the area for zones, of the whole label for pictures.
     start: Edges,
-    /// Where the pointer went down, in fractions of the area.
+    /// Where the pointer went down, same units as `start`.
     origin: Pos2,
 }
 
@@ -279,7 +380,9 @@ pub struct Editor {
     redo: Vec<Vec<Entry>>,
     next_id: u64,
     selected: Option<u64>,
+    /// At most one of `field` and `picture` is selected.
     field: Option<usize>,
+    picture: Option<usize>,
     /// Preview size, by title.
     size: String,
     orientation: Orientation,
@@ -295,6 +398,13 @@ pub struct Editor {
     typing: bool,
     /// The web page has no window frame to close the editor with, so it gets a button.
     close_clicked: bool,
+    /// The preview label in dots, as read: what picture fractions are of.
+    label_px: Vec2,
+    picker: FilePicker,
+    import_error: Option<String>,
+    /// Live bitmaps of pictures still being placed: (template, index) → texture.
+    /// Kept out of the label render, so scaling one does not re-render the whole label.
+    picture_textures: HashMap<(String, usize), app::PendingTexture>,
 }
 
 impl Editor {
@@ -364,13 +474,26 @@ impl Editor {
         if self.current().is_none() {
             self.selected = self.draft.first().map(|e| e.id);
             self.field = None;
+            self.picture = None;
         }
-        let fields = self.current().map_or(0, |i| self.draft[i].template.fields.len());
+        let (fields, pictures) =
+            self.current().map_or((0, 0), |i| (self.draft[i].template.fields.len(), self.draft[i].template.pictures.len()));
         self.field = self.field.filter(|&f| f < fields);
+        self.picture = self.picture.filter(|&p| p < pictures && self.field.is_none());
     }
 
     fn can_save(&self) -> bool {
-        self.writer.is_some() && Problems::of(&self.draft).is_empty()
+        self.writer.is_some() && !Problems::of(&self.draft).blocks_save()
+    }
+
+    /// After a save the sources are gone: earlier undo steps keep pictures as they looked then, baked.
+    fn forget_sources(&mut self) {
+        let steps = self.undo.iter_mut().chain(self.redo.iter_mut()).chain([&mut self.committed]);
+        for e in steps.flatten() {
+            for p in &mut e.template.pictures {
+                p.pending = None;
+            }
+        }
     }
 
     fn save(&mut self) -> Option<Vec<Template>> {
@@ -380,6 +503,7 @@ impl Editor {
             Ok(()) => {
                 self.before_save = Some(mem::replace(&mut self.baseline, self.draft.clone()));
                 self.save_error = None;
+                self.forget_sources();
                 Some(templates)
             }
             Err(e) => {
@@ -435,22 +559,56 @@ impl Editor {
             self.step_back();
         }
         let Some(ti) = self.current() else { return saved };
-        let fields = &mut self.draft[ti].template.fields;
+        let template = &mut self.draft[ti].template;
 
+        // Tab walks the fields, then the pictures.
         let prev = key(Modifiers::SHIFT, Key::Tab);
         let next = !prev && key(Modifiers::NONE, Key::Tab);
-        if (next || prev) && !fields.is_empty() {
-            let n = fields.len();
-            self.field = Some(match (self.field, prev) {
+        let (nf, n) = (template.fields.len(), template.fields.len() + template.pictures.len());
+        if (next || prev) && n > 0 {
+            let at = self.field.or(self.picture.map(|p| nf + p));
+            let to = match (at, prev) {
                 (Some(i), false) => (i + 1) % n,
                 (Some(i), true) => (i + n - 1) % n,
                 (None, false) => 0,
                 (None, true) => n - 1,
-            });
+            };
+            (self.field, self.picture) = if to < nf { (Some(to), None) } else { (None, Some(to - nf)) };
         }
         if key(Modifiers::NONE, Key::Escape) {
             self.field = None;
+            self.picture = None;
         }
+        if let Some(pi) = self.picture.filter(|&i| i < template.pictures.len()) {
+            let (pictures, label) = (&mut template.pictures, self.label_px);
+            if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
+                pictures.remove(pi);
+                self.picture = (!pictures.is_empty()).then(|| pi.min(pictures.len() - 1));
+            } else if key(Modifiers::COMMAND, Key::D) {
+                let mut copy = pictures[pi].clone();
+                let b = picture_box(&copy, label);
+                place(&mut copy, b.l + 2.0 * NUDGE, b.t + 2.0 * NUDGE, label);
+                pictures.insert(pi + 1, copy);
+                self.picture = Some(pi + 1);
+            } else {
+                let arrows = [(Key::ArrowLeft, -1.0, 0.0), (Key::ArrowRight, 1.0, 0.0), (Key::ArrowUp, 0.0, -1.0), (Key::ArrowDown, 0.0, 1.0)];
+                for (arrow, dx, dy) in arrows {
+                    let step = if key(Modifiers::SHIFT, arrow) {
+                        NUDGE_FAR
+                    } else if key(Modifiers::NONE, arrow) {
+                        NUDGE
+                    } else {
+                        continue;
+                    };
+                    let p = &mut pictures[pi];
+                    let b = picture_box(p, label);
+                    place(p, b.l + dx * step, b.t + dy * step, label);
+                }
+            }
+            Self::keep_focus_still(ctx);
+            return saved;
+        }
+        let fields = &mut template.fields;
         let Some(fi) = self.field.filter(|&i| i < fields.len()) else {
             Self::keep_focus_still(ctx);
             return saved;
@@ -521,6 +679,23 @@ impl Editor {
         });
         CentralPanel::default().show(ui, |ui| self.canvas(ui, t, fonts, sizes));
         self.closing_question(&ctx, t, &mut saved);
+        match self.picker.take() {
+            Some(Ok(bytes)) => self.add_picture(&bytes, None),
+            Some(Err(e)) => self.import_error = Some(e),
+            None => {}
+        }
+        // Pending pictures convert here: rate-limited while the pointer is dragging them,
+        // immediately once it is up.
+        let busy = ctx.input(|i| i.pointer.any_down());
+        for e in &mut self.draft {
+            for p in &mut e.template.pictures {
+                if busy {
+                    p.refresh();
+                } else {
+                    p.refresh_now();
+                }
+            }
+        }
 
         self.fix_selection();
         self.commit_undo_step(&ctx);
@@ -562,8 +737,8 @@ impl Editor {
             }
             if self.writer.is_none() {
                 ui.colored_label(ui.visuals().warn_fg_color, t.no_file);
-            } else if !problems.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, t.fix_errors);
+            } else if let Some(why) = problems.blocker(t) {
+                ui.colored_label(ui.visuals().error_fg_color, why);
             } else if let Some(e) = &self.save_error {
                 ui.colored_label(ui.visuals().error_fg_color, format!("{} {e}", t.save_failed));
             }
@@ -589,6 +764,7 @@ impl Editor {
                     name: unique_name(t.new_template, &taken),
                     orientation: None,
                     fields: vec![Field { name: t.default_field.to_owned(), ..Field::default() }],
+                    pictures: Vec::new(),
                 };
                 let entry = self.entry(template);
                 self.selected = Some(entry.id);
@@ -624,10 +800,12 @@ impl Editor {
             }
         });
         for e in &self.draft {
-            let text = list_item(ui, &e.template.name, t, problems.templates.contains_key(&e.id));
+            let bad = problems.templates.contains_key(&e.id) || problems.pending.contains(&e.id);
+            let text = list_item(ui, &e.template.name, t, bad);
             if ui.selectable_label(Some(e.id) == self.selected, text).clicked() && Some(e.id) != self.selected {
                 self.selected = Some(e.id);
                 self.field = None;
+                self.picture = None;
             }
         }
 
@@ -645,6 +823,7 @@ impl Editor {
                 free_band(fields).apply(&mut f);
                 fields.push(f);
                 self.field = Some(fields.len() - 1);
+                self.picture = None;
             }
             if ui.add_enabled(field.is_some(), Button::new(t.delete).small()).clicked()
                 && let Some(i) = field
@@ -669,6 +848,38 @@ impl Editor {
             let text = list_item(ui, &f.name, t, problems.fields.contains_key(&(id, i)));
             if ui.selectable_label(self.field == Some(i), text).clicked() {
                 self.field = Some(i);
+                self.picture = None;
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(RichText::new(t.pictures_heading).strong());
+        let picture = self.picture;
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button(t.add).clicked() {
+                self.picker.open(ui.ctx());
+            }
+            if ui.add_enabled(picture.is_some(), Button::new(t.delete).small()).clicked()
+                && let Some(i) = picture
+            {
+                self.draft[ti].template.pictures.remove(i);
+                self.picture = None;
+            }
+        });
+        if let Some(e) = &self.import_error {
+            ui.colored_label(ui.visuals().error_fg_color, format!("{} {e}", t.picture_failed));
+        }
+        for (i, p) in self.draft[ti].template.pictures.iter().enumerate() {
+            let (w, h) = (px_to_mm(p.bitmap.width_px), px_to_mm(p.bitmap.height_px));
+            let mut text = format!("{} {} · {w:.1}×{h:.1} {}", t.picture, i + 1, t.mm);
+            if p.pending.is_some() {
+                text = format!("{text} · {}", t.not_baked);
+            }
+            let text = if p.pending.is_some() { RichText::new(text).color(PENDING) } else { RichText::new(text) };
+            if ui.selectable_label(self.picture == Some(i), text).clicked() {
+                self.picture = Some(i);
+                self.field = None;
             }
         }
     }
@@ -693,6 +904,10 @@ impl Editor {
 
         ui.add_space(8.0);
         ui.separator();
+        if let Some(pi) = self.picture.filter(|&i| i < template.pictures.len()) {
+            picture_properties(ui, t, &mut template.pictures[pi], self.label_px);
+            return;
+        }
         let Some(fi) = self.field.filter(|&i| i < template.fields.len()) else {
             ui.weak(t.pick_field);
             return;
@@ -748,6 +963,36 @@ impl Editor {
         });
     }
 
+    /// Adds a picture from a PNG or JPEG file, centred at `at` (fractions of the label) or in the middle.
+    fn add_picture(&mut self, bytes: &[u8], at: Option<Pos2>) {
+        let Some(ti) = self.current() else { return };
+        let source = match Source::decode(bytes) {
+            Ok(source) => source,
+            Err(e) => {
+                self.import_error = Some(e);
+                return;
+            }
+        };
+        self.import_error = None;
+        let label = self.label_px;
+        // Fitted into half of the area inside the margins.
+        let margins = 2.0 * (MARGIN_MM * DPI as f32 / 25.4).round();
+        let fit = ((label - Vec2::splat(margins)) * 0.5).max(Vec2::splat(MIN_PICTURE_PX as f32));
+        let (sw, sh) = source.size();
+        let scale = (fit.x / sw as f32).min(fit.y / sh as f32);
+        let width_px = ((sw as f32 * scale).round() as u32).max(MIN_PICTURE_PX);
+        let settings = Settings { width_px, mode: Mode::Threshold, threshold: 128, invert: false };
+        let (pending, bitmap) = Pending::new(source, settings);
+        let mut p = Picture { x: 0.5, y: 0.5, anchor: Anchor::Center, anchor_locked: false, bitmap, pending: Some(pending) };
+        let c = at.unwrap_or(Pos2::new(0.5, 0.5));
+        let (w, h) = (p.bitmap.width_px as f32 / label.x, p.bitmap.height_px as f32 / label.y);
+        place(&mut p, c.x - w / 2.0, c.y - h / 2.0, label);
+        let pictures = &mut self.draft[ti].template.pictures;
+        pictures.push(p);
+        self.picture = Some(pictures.len() - 1);
+        self.field = None;
+    }
+
     fn rerender(&mut self, ctx: &egui::Context, fonts: &Fonts, key: RenderKey) {
         if self.rendered.as_ref().is_some_and(|(k, ..)| *k == key) {
             return;
@@ -777,7 +1022,10 @@ impl Editor {
 
         let Some(ti) = self.current() else { return };
         let Some(size) = sizes.iter().find(|s| s.title() == self.size).or(sizes.first()).cloned() else { return };
-        let template = self.draft[ti].template.clone();
+        // Pictures still being place are drawn over the preview live, so they must not
+        // be part of the render key: scaling one would re-render the whole label each frame.
+        let mut template = self.draft[ti].template.clone();
+        template.pictures.retain(|p| p.pending.is_none());
         let texts = template.fields.iter().map(|f| if f.sample.is_empty() { f.name.clone() } else { f.sample.clone() }).collect();
         self.rerender(ui.ctx(), fonts, RenderKey { size, template, orientation: self.orientation, texts });
         let Some((_, r, texture)) = &self.rendered else { return };
@@ -788,38 +1036,64 @@ impl Editor {
         let area = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         let background = ui.allocate_rect(area, Sense::click_and_drag());
         let label = app::paint_label(ui, area, &texture, px);
+        self.label_px = px;
         let margin = (MARGIN_MM * DPI as f32 / 25.4).round() * label.width() / px.x;
-        self.zones(ui, label.shrink(margin), &background, t);
+        self.zones(ui, label, label.shrink(margin), &background, t);
+        self.dropped_files(ui, label, t);
     }
 
-    /// Frames of the fields over the preview, and dragging them around.
-    fn zones(&mut self, ui: &mut Ui, content: Rect, background: &Response, t: &Tr) {
+    /// Frames of the fields and pictures over the preview, and dragging them around.
+    fn zones(&mut self, ui: &mut Ui, label: Rect, content: Rect, background: &Response, t: &Tr) {
         let Some(ti) = self.current() else { return };
         let id = self.draft[ti].id;
+        let px = self.label_px;
         let to_frac = |p: Pos2| Pos2::new((p.x - content.min.x) / content.width(), (p.y - content.min.y) / content.height());
+        let to_label = |p: Pos2| Pos2::new((p.x - label.min.x) / label.width(), (p.y - label.min.y) / label.height());
         let to_screen = |e: Edges| {
             Rect::from_min_max(content.lerp_inside(Vec2::new(e.l, e.t)), content.lerp_inside(Vec2::new(e.r, e.b)))
         };
-        let n = self.draft[ti].template.fields.len();
-        let edges: Vec<Edges> = self.draft[ti].template.fields.iter().map(Edges::of).collect();
-        let origin = ui.input(|i| i.pointer.press_origin()).map(to_frac).unwrap_or_default();
+        let label_to_screen = |e: Edges| {
+            Rect::from_min_max(label.lerp_inside(Vec2::new(e.l, e.t)), label.lerp_inside(Vec2::new(e.r, e.b)))
+        };
+        // Zones are fractions of the area inside the margins, pictures of the whole label.
+        let (m, k) = ((content.min - label.min) / label.size(), content.size() / label.size());
+        let zone_to_label = |e: Edges| Edges { l: m.x + e.l * k.x, t: m.y + e.t * k.y, r: m.x + e.r * k.x, b: m.y + e.b * k.y };
+        let label_to_zone = |e: Edges| Edges { l: (e.l - m.x) / k.x, t: (e.t - m.y) / k.y, r: (e.r - m.x) / k.x, b: (e.b - m.y) / k.y };
+
+        let template = &self.draft[ti].template;
+        let (n, np) = (template.fields.len(), template.pictures.len());
+        let edges: Vec<Edges> = template.fields.iter().map(Edges::of).collect();
+        let boxes: Vec<Edges> = template.pictures.iter().map(|p| picture_box(p, px)).collect();
+        let press = ui.input(|i| i.pointer.press_origin());
+        let origin = press.map(to_frac).unwrap_or_default();
+        let origin_label = press.map(to_label).unwrap_or_default();
 
         if background.drag_started() {
             self.drag = Some(Drag { kind: DragKind::Create, start: Edges { l: 0.0, t: 0.0, r: 0.0, b: 0.0 }, origin });
         }
         if background.clicked() {
             self.field = None;
+            self.picture = None;
         }
-        // The selected zone goes last so that it wins where zones overlap.
-        let selected = self.field.filter(|&i| i < n);
-        let order: Vec<usize> = (0..n).filter(|&i| Some(i) != selected).chain(selected).collect();
-        for i in order {
-            let response = ui.interact(to_screen(edges[i]), Id::new(("zone", id, i)), Sense::click_and_drag());
+        // Pictures go over zones, and the selected item last, so that it wins where they overlap.
+        let field = self.field.filter(|&i| i < n);
+        let picture = self.picture.filter(|&i| i < np);
+        let zone_order = (0..n).filter(|&i| Some(i) != field).map(|i| (false, i));
+        let picture_order = (0..np).filter(|&i| Some(i) != picture).map(|i| (true, i));
+        let selected = field.map(|i| (false, i)).or(picture.map(|i| (true, i)));
+        let order: Vec<(bool, usize)> = zone_order.chain(picture_order).chain(selected).collect();
+        for (is_picture, i) in order {
+            let (rect, key) = if is_picture { (label_to_screen(boxes[i]), "picture") } else { (to_screen(edges[i]), "zone") };
+            let response = ui.interact(rect, Id::new((key, id, i)), Sense::click_and_drag());
             if response.clicked() || response.drag_started() {
-                self.field = Some(i);
+                (self.field, self.picture) = if is_picture { (None, Some(i)) } else { (Some(i), None) };
             }
             if response.drag_started() {
-                self.drag = Some(Drag { kind: DragKind::Zone { field: i, grab: Grab::Move }, start: edges[i], origin });
+                self.drag = Some(if is_picture {
+                    Drag { kind: DragKind::Picture { picture: i, grab: PictureGrab::Move }, start: boxes[i], origin: origin_label }
+                } else {
+                    Drag { kind: DragKind::Zone { field: i, grab: Grab::Move }, start: edges[i], origin }
+                });
             }
             response.on_hover_cursor(CursorIcon::Move);
         }
@@ -833,24 +1107,36 @@ impl Editor {
                 response.on_hover_cursor(cursor);
             }
         }
+        if let Some(i) = self.picture.filter(|&i| i < np && self.draft[ti].template.pictures[i].pending.is_some()) {
+            for (k, (grab, pos, cursor)) in corner_grips(label_to_screen(boxes[i])).into_iter().enumerate() {
+                let rect = Rect::from_center_size(pos, Vec2::splat(12.0));
+                let response = ui.interact(rect, Id::new(("corner", id, i, k)), Sense::drag());
+                if response.drag_started() {
+                    self.drag = Some(Drag { kind: DragKind::Picture { picture: i, grab }, start: boxes[i], origin: origin_label });
+                }
+                response.on_hover_cursor(cursor);
+            }
+        }
 
-        let (pointer, down, alt) =
-            ui.input(|i| (i.pointer.latest_pos().map(to_frac), i.pointer.primary_down(), i.modifiers.alt));
+        let (screen_pointer, down, alt) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.modifiers.alt));
         let mut band = None;
         if let Some(drag) = &self.drag
-            && let Some(p) = pointer
+            && let Some(sp) = screen_pointer
         {
+            let p = to_frac(sp);
             let tol = Vec2::new(SNAP_PX / content.width(), SNAP_PX / content.height());
-            let fields = &mut self.draft[ti].template.fields;
+            let template = &mut self.draft[ti].template;
+            let fields = &mut template.fields;
+            // Zones also stick to the pictures, and pictures to the zones and the margins.
+            let picture_zones = || boxes.iter().map(|b| label_to_zone(*b));
             match drag.kind {
                 DragKind::Zone { field, grab } if field < fields.len() => {
                     let others = edges.iter().enumerate().filter(|&(j, _)| j != field).map(|(_, e)| *e);
-                    let snap = (!alt).then(|| Snap::new(others, tol));
+                    let snap = (!alt).then(|| Snap::new(others.chain(picture_zones()), tol));
                     dragged(drag.start, grab, p - drag.origin, snap.as_ref()).apply(&mut fields[field]);
                 }
-                DragKind::Zone { .. } => {}
                 DragKind::Create => {
-                    let snap = (!alt).then(|| Snap::new(edges.iter().copied(), tol));
+                    let snap = (!alt).then(|| Snap::new(edges.iter().copied().chain(picture_zones()), tol));
                     let e = spanned(drag.origin, p, snap.as_ref());
                     if !down && e.r - e.l >= MIN_SIDE && e.b - e.t >= MIN_SIDE {
                         let taken: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -858,9 +1144,31 @@ impl Editor {
                         e.apply(&mut f);
                         fields.push(f);
                         self.field = Some(fields.len() - 1);
+                        self.picture = None;
                     }
                     band = Some(e);
                 }
+                DragKind::Picture { picture, grab } if picture < template.pictures.len() => {
+                    let p = to_label(sp);
+                    let pic = &mut template.pictures[picture];
+                    match grab {
+                        PictureGrab::Move => {
+                            let s = drag.start;
+                            let (mut l, mut t) = (s.l + p.x - drag.origin.x, s.t + p.y - drag.origin.y);
+                            if !alt {
+                                let margins = Edges { l: m.x, t: m.y, r: m.x + k.x, b: m.y + k.y };
+                                let zones = edges.iter().map(|e| zone_to_label(*e));
+                                let others = boxes.iter().enumerate().filter(|&(j, _)| j != picture).map(|(_, b)| *b);
+                                let snap = Snap::new(zones.chain(others).chain([margins]), Vec2::splat(SNAP_PX) / label.size());
+                                l += snap_shift(l, l + s.r - s.l, &snap.xs, snap.tol.x);
+                                t += snap_shift(t, t + s.b - s.t, &snap.ys, snap.tol.y);
+                            }
+                            place(pic, l, t, px);
+                        }
+                        PictureGrab::Corner { right, bottom } => resize_picture(pic, drag.start, right, bottom, p, px),
+                    }
+                }
+                DragKind::Zone { .. } | DragKind::Picture { .. } => {}
             }
         }
         if !down {
@@ -868,9 +1176,28 @@ impl Editor {
             band = None;
         }
 
-        let painter = ui.painter_at(content.expand(8.0));
+        // A picture still being placed is drawn here, live, on top of the cached label render;
+        // its frame and grips paint over the bitmap below.
+        let mut live: HashSet<(String, usize)> = HashSet::new();
+        for (i, p) in self.draft[ti].template.pictures.iter().enumerate() {
+            let Some(pending) = &p.pending else { continue };
+            let rect = label_to_screen(boxes[i]);
+            let key = (self.draft[ti].template.name.clone(), i);
+            let version = pending.version();
+            if !pending_fresh(&self.picture_textures, &key, &version) {
+                pending_update(ui.ctx(), &mut self.picture_textures, key.clone(), version, &p.bitmap);
+            }
+            let texture = self.picture_textures[&key].texture.id();
+            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            ui.painter().image(texture, rect, uv, Color32::WHITE);
+            live.insert(key);
+        }
+        self.picture_textures.retain(|k, _| live.contains(k));
+
+        let painter = ui.painter_at(label.expand(8.0));
         let faint = Color32::from_rgba_unmultiplied(0x2f, 0x81, 0xf7, 120);
-        for (i, f) in self.draft[ti].template.fields.iter().enumerate() {
+        let template = &self.draft[ti].template;
+        for (i, f) in template.fields.iter().enumerate() {
             let rect = to_screen(Edges::of(f));
             let selected = self.field == Some(i);
             let stroke = if selected { Stroke::new(2.0, ACCENT) } else { Stroke::new(1.0, faint) };
@@ -879,9 +1206,26 @@ impl Editor {
             painter.text(rect.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, &f.name, FontId::proportional(11.0), color);
             if selected {
                 for (_, pos, _) in grips(rect) {
-                    let grip = Rect::from_center_size(pos, Vec2::splat(7.0));
-                    painter.rect_filled(grip, 1.0, Color32::WHITE);
-                    painter.rect_stroke(grip, 1.0, Stroke::new(1.5, ACCENT), StrokeKind::Middle);
+                    paint_grip(&painter, pos);
+                }
+            }
+        }
+        for (i, p) in template.pictures.iter().enumerate() {
+            let rect = label_to_screen(picture_box(p, px));
+            let selected = self.picture == Some(i);
+            let color = match (p.pending.is_some(), selected) {
+                (true, _) => PENDING,
+                (false, true) => ACCENT,
+                (false, false) => faint,
+            };
+            painter.rect_stroke(rect, 0.0, Stroke::new(if selected { 2.0 } else { 1.0 }, color), StrokeKind::Outside);
+            if p.pending.is_some() {
+                let text = format!("{} {} · {}", t.picture, i + 1, t.not_baked);
+                painter.text(rect.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, text, FontId::proportional(11.0), color);
+                if selected {
+                    for (_, pos, _) in corner_grips(rect) {
+                        paint_grip(&painter, pos);
+                    }
                 }
             }
         }
@@ -895,6 +1239,31 @@ impl Editor {
         }
     }
 
+    /// Files dropped onto the canvas become pictures centred where they were dropped.
+    fn dropped_files(&mut self, ui: &Ui, label: Rect, t: &Tr) {
+        let (hovering, dropped, pos) =
+            ui.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        if hovering {
+            ui.painter().rect_filled(label, 3.0, ACCENT.gamma_multiply(0.15));
+            ui.painter().text(label.center(), Align2::CENTER_CENTER, t.drop_here, FontId::proportional(16.0), ACCENT);
+        }
+        let at = pos
+            .filter(|p| label.contains(*p))
+            .map(|p| Pos2::new((p.x - label.min.x) / label.width(), (p.y - label.min.y) / label.height()));
+        for file in dropped {
+            let bytes = match (&file.bytes, &file.path) {
+                (Some(bytes), _) => Ok(bytes.to_vec()),
+                #[cfg(not(target_arch = "wasm32"))]
+                (None, Some(path)) => std::fs::read(path).map_err(|e| e.to_string()),
+                _ => Err(file.name.clone()),
+            };
+            match bytes {
+                Ok(bytes) => self.add_picture(&bytes, at),
+                Err(e) => self.import_error = Some(e),
+            }
+        }
+    }
+
     fn closing_question(&mut self, ctx: &egui::Context, t: &Tr, saved: &mut Option<Vec<Template>>) {
         let Some(quitting) = self.closing else { return };
         #[derive(PartialEq)]
@@ -905,10 +1274,12 @@ impl Editor {
         }
         let mut choice = None;
         let can_save = self.can_save();
+        let blocker = Problems::of(&self.draft).blocker(t);
         egui::Modal::new(Id::new("unsaved-templates")).show(ctx, |ui| {
             ui.label(RichText::new(t.unsaved).strong().size(15.0));
             if !can_save {
-                ui.colored_label(ui.visuals().error_fg_color, if self.writer.is_none() { t.no_file } else { t.fix_errors });
+                let why = if self.writer.is_none() { t.no_file } else { blocker.unwrap_or(t.fix_errors) };
+                ui.colored_label(ui.visuals().error_fg_color, why);
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -948,6 +1319,96 @@ impl Editor {
     }
 }
 
+fn picture_properties(ui: &mut Ui, t: &Tr, p: &mut Picture, label: Vec2) {
+    ui.label(RichText::new(t.picture).strong());
+    let (w, h) = (px_to_mm(p.bitmap.width_px), px_to_mm(p.bitmap.height_px));
+    ui.label(format!("{}: {w:.1} × {h:.1} {}", t.picture_size, t.mm));
+    if let Some(pending) = &mut p.pending {
+        let s = &mut pending.settings;
+        ui.horizontal(|ui| {
+            ui.label(t.picture_width);
+            let mut mm = px_to_mm(s.width_px);
+            let value = DragValue::new(&mut mm).range(1.0..=1000.0).speed(0.1).max_decimals(1).suffix(format!(" {}", t.mm));
+            if ui.add(value).changed() {
+                s.width_px = mm_to_px(mm);
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(t.mode);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut s.mode, Mode::Threshold, t.mode_threshold).on_hover_text(t.mode_threshold_hint);
+            ui.selectable_value(&mut s.mode, Mode::Dither, t.mode_dither).on_hover_text(t.mode_dither_hint);
+        });
+        if s.mode == Mode::Threshold {
+            ui.add(egui::Slider::new(&mut s.threshold, 1..=255).text(t.threshold));
+        }
+        ui.checkbox(&mut s.invert, t.invert).on_hover_text(t.invert_hint);
+    }
+
+    ui.add_space(6.0);
+    ui.label(t.anchor).on_hover_text(t.anchor_hint);
+    ui.horizontal(|ui| {
+        if let Some(anchor) = anchor_grid(ui, p.anchor) {
+            let b = picture_box(p, label);
+            p.anchor = anchor;
+            p.anchor_locked = true;
+            place(p, b.l, b.t, label);
+        }
+        let mut auto = !p.anchor_locked;
+        if ui.checkbox(&mut auto, t.anchor_auto).changed() {
+            let b = picture_box(p, label);
+            p.anchor_locked = !auto;
+            place(p, b.l, b.t, label);
+        }
+    });
+    ui.label(t.anchor_position);
+    Grid::new("anchor-position").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+        ui.label("x");
+        ui.add(fraction(&mut p.x, 1.0));
+        ui.label("y");
+        ui.add(fraction(&mut p.y, 1.0));
+        ui.end_row();
+    });
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button(t.rotate).clicked() {
+            rotate_picture(p);
+        }
+        if p.pending.is_some() && ui.button(RichText::new(t.bake).strong()).clicked() {
+            p.pending = None;
+        }
+    });
+    if p.pending.is_some() {
+        ui.weak(t.bake_hint);
+    }
+}
+
+/// A 3×3 grid of the anchors; returns the one clicked.
+fn anchor_grid(ui: &mut Ui, current: Anchor) -> Option<Anchor> {
+    let (cell, gap) = (16.0, 3.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(3.0 * cell + 2.0 * gap), Sense::hover());
+    ui.painter().rect_stroke(rect.shrink(cell / 2.0), 0.0, Stroke::new(1.0, ui.visuals().weak_text_color()), StrokeKind::Middle);
+    let mut picked = None;
+    for (i, &anchor) in Anchor::ALL.iter().enumerate() {
+        let min = rect.min + Vec2::new((i % 3) as f32, (i / 3) as f32) * (cell + gap);
+        let r = Rect::from_min_size(min, Vec2::splat(cell));
+        let response = ui.interact(r, ui.id().with(("anchor", i)), Sense::click());
+        let color = if anchor == current {
+            ACCENT
+        } else if response.hovered() {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().widgets.inactive.bg_fill
+        };
+        ui.painter().circle_filled(r.center(), cell * 0.35, color);
+        if response.clicked() {
+            picked = Some(anchor);
+        }
+    }
+    picked
+}
+
 fn fraction(v: &mut f32, max: f32) -> DragValue<'_> {
     DragValue::new(v).range(0.0..=max).speed(0.002).max_decimals(3)
 }
@@ -971,6 +1432,23 @@ fn name_input(ui: &mut Ui, name: &mut String, problem: Option<Problem>, t: &Tr) 
         };
         ui.colored_label(ui.visuals().error_fg_color, text);
     }
+}
+
+fn paint_grip(painter: &egui::Painter, pos: Pos2) {
+    let grip = Rect::from_center_size(pos, Vec2::splat(7.0));
+    painter.rect_filled(grip, 1.0, Color32::WHITE);
+    painter.rect_stroke(grip, 1.0, Stroke::new(1.5, ACCENT), StrokeKind::Middle);
+}
+
+/// Corner grips of a picture being placed: it keeps its proportions, so there are no edge ones.
+fn corner_grips(r: Rect) -> [(PictureGrab, Pos2, CursorIcon); 4] {
+    let corner = |right, bottom| PictureGrab::Corner { right, bottom };
+    [
+        (corner(false, false), r.left_top(), CursorIcon::ResizeNwSe),
+        (corner(true, false), r.right_top(), CursorIcon::ResizeNeSw),
+        (corner(false, true), r.left_bottom(), CursorIcon::ResizeNeSw),
+        (corner(true, true), r.right_bottom(), CursorIcon::ResizeNwSe),
+    ]
 }
 
 /// Corner and edge-middle grips of a zone: what each one moves, where it is, its cursor.
@@ -1074,7 +1552,8 @@ mod tests {
     }
 
     fn template(name: &str) -> Template {
-        Template { name: name.into(), orientation: None, fields: vec![Field { name: "F".into(), ..Field::default() }] }
+        let fields = vec![Field { name: "F".into(), ..Field::default() }];
+        Template { name: name.into(), orientation: None, fields, pictures: Vec::new() }
     }
 
     #[test]
@@ -1206,5 +1685,126 @@ mod tests {
         e.draft[0].template.name = "Mine".into();
         e.file_changed(&[template("Again from disk")]);
         assert_eq!(e.draft[0].template.name, "Mine");
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_luma8(w, h).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    /// The badge editor after one frame, so the canvas knows the label size, with a 200×100 picture added.
+    fn with_picture(path: Option<&std::path::Path>) -> (Editor, egui::Context) {
+        let (mut e, ctx) = badge_editor(path);
+        press(&mut e, &ctx, Modifiers::NONE, Key::F20);
+        e.add_picture(&png(200, 100), None);
+        (e, ctx)
+    }
+
+    fn pictures(e: &Editor) -> &[Picture] {
+        &e.draft[e.current().unwrap()].template.pictures
+    }
+
+    #[test]
+    fn added_picture_fits_half_the_area_and_waits_to_be_baked() {
+        let (e, _) = with_picture(None);
+        let p = &pictures(&e)[0];
+        let content_w = e.label_px.x - 2.0 * (MARGIN_MM * DPI as f32 / 25.4).round();
+        assert_eq!(p.bitmap.width_px, (content_w / 2.0).round() as u32);
+        assert_eq!(p.bitmap.height_px, p.bitmap.width_px / 2);
+        assert_eq!((p.anchor, p.x, p.y), (Anchor::Center, 0.5, 0.5));
+        assert!(p.pending.is_some() && !e.can_save());
+        assert_eq!(e.picture, Some(0));
+    }
+
+    #[test]
+    fn moving_picks_the_anchor_by_thirds_unless_locked() {
+        let label = Vec2::new(400.0, 200.0);
+        let mut p = Picture {
+            x: 0.5,
+            y: 0.5,
+            anchor: Anchor::Center,
+            anchor_locked: false,
+            bitmap: itmo_labels_core::label::Bitmap::blank(0.0, 0.0, 40, 20),
+            pending: None,
+        };
+        place(&mut p, 0.9, 0.9, label);
+        assert_eq!(p.anchor, Anchor::BottomRight);
+        assert!((p.x - 1.0).abs() < 1e-6 && (p.y - 1.0).abs() < 1e-6, "{p:?}");
+        p.anchor_locked = true;
+        place(&mut p, 0.0, 0.0, label);
+        assert_eq!(p.anchor, Anchor::BottomRight, "locked");
+        assert_eq!((p.x, p.y), (0.1, 0.1));
+        let b = picture_box(&p, label);
+        assert!(b.l.abs() < 1e-6 && b.t.abs() < 1e-6, "{b:?}");
+    }
+
+    #[test]
+    fn corner_resize_keeps_the_opposite_corner_and_proportions() {
+        let (mut e, _) = with_picture(None);
+        let label = e.label_px;
+        let ti = e.current().unwrap();
+        let p = &mut e.draft[ti].template.pictures[0];
+        let start = picture_box(p, label);
+        let pointer = Pos2::new(start.r + 40.0 / label.x, start.b);
+        resize_picture(p, start, true, true, pointer, label);
+        p.refresh_now();
+        let b = picture_box(p, label);
+        assert!((b.l - start.l).abs() * label.x <= 1.0 && (b.t - start.t).abs() * label.y <= 1.0, "{start:?} → {b:?}");
+        assert_eq!(p.bitmap.height_px, (p.bitmap.width_px as f32 / 2.0).round() as u32);
+        assert!(p.bitmap.width_px > 0 && (b.r - start.r) * label.x > 30.0);
+    }
+
+    #[test]
+    fn baking_can_be_undone_until_saved() {
+        let path = std::env::temp_dir().join(format!("itmo-labels-picture-test-{}.toml", std::process::id()));
+        let (mut e, ctx) = with_picture(Some(&path));
+        press(&mut e, &ctx, Modifiers::NONE, Key::F20);
+        press(&mut e, &ctx, Modifiers::COMMAND, Key::S);
+        assert!(!path.exists(), "not baked: nothing written");
+        let ti = e.current().unwrap();
+        e.draft[ti].template.pictures[0].pending = None;
+        press(&mut e, &ctx, Modifiers::NONE, Key::F20);
+        press(&mut e, &ctx, Modifiers::COMMAND, Key::Z);
+        assert!(pictures(&e)[0].pending.is_some(), "undo brings the source back");
+        press(&mut e, &ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+        press(&mut e, &ctx, Modifiers::COMMAND, Key::S);
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(written.contains("[[template.picture]]"));
+        press(&mut e, &ctx, Modifiers::COMMAND, Key::Z);
+        assert_eq!(pictures(&e).len(), 1, "the step before baking");
+        assert!(pictures(&e)[0].pending.is_none(), "but the source is gone after the save");
+    }
+
+    #[test]
+    fn tab_walks_into_pictures_and_delete_removes_them() {
+        let (mut e, ctx) = with_picture(None);
+        e.picture = None;
+        e.field = Some(3);
+        press(&mut e, &ctx, Modifiers::NONE, Key::Tab);
+        assert_eq!((e.field, e.picture), (None, Some(0)));
+        press(&mut e, &ctx, Modifiers::NONE, Key::Tab);
+        assert_eq!((e.field, e.picture), (Some(0), None), "wraps around to the fields");
+        e.field = None;
+        e.picture = Some(0);
+        press(&mut e, &ctx, Modifiers::NONE, Key::ArrowRight);
+        assert!(pictures(&e)[0].x > 0.5);
+        press(&mut e, &ctx, Modifiers::NONE, Key::Delete);
+        assert!(pictures(&e).is_empty() && e.picture.is_none());
+        assert_eq!(names(&e).len(), 4, "fields untouched");
+    }
+
+    #[test]
+    fn turning_a_picture_swaps_its_sides() {
+        let (mut e, _) = with_picture(None);
+        let ti = e.current().unwrap();
+        let p = &mut e.draft[ti].template.pictures[0];
+        let (w, h) = (p.bitmap.width_px, p.bitmap.height_px);
+        rotate_picture(p);
+        assert_eq!((p.bitmap.width_px, p.bitmap.height_px), (h, w), "while placing");
+        p.pending = None;
+        rotate_picture(p);
+        assert_eq!((p.bitmap.width_px, p.bitmap.height_px), (w, h), "baked");
     }
 }
