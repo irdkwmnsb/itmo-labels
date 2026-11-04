@@ -389,25 +389,23 @@ impl Picture {
         render::Picture { bitmap: &self.bitmap, at: (self.x, self.y), anchor: self.anchor.fractions() }
     }
 
-    /// Converts the source again if its settings changed since `bitmap` was made;
-    /// rapid changes (a dragged slider or corner) are rate-limited to keep the UI smooth.
+    /// Converts the source again if its settings changed since `bitmap` was made.
+    /// The conversion runs off the UI thread on desktop, so a dragged slider or corner
+    /// stays smooth even for a large dither; on the web it is rate-limited instead.
     pub fn refresh(&mut self) {
         if let Some(p) = &mut self.pending
-            && p.made != p.settings
-            && p.due()
+            && let Some(bitmap) = p.refresh()
         {
-            self.bitmap = p.convert();
-            p.made = p.settings;
+            self.bitmap = bitmap;
         }
     }
 
     /// Converts right now if the settings changed: pointer up, rotation, baking.
     pub fn refresh_now(&mut self) {
         if let Some(p) = &mut self.pending
-            && p.made != p.settings
+            && let Some(bitmap) = p.refresh_now()
         {
-            self.bitmap = p.convert();
-            p.made = p.settings;
+            self.bitmap = bitmap;
         }
     }
 
@@ -519,8 +517,9 @@ fn validate_templates(templates: &[Template]) -> Result<(), String> {
             validate_field(f).map_err(|e| format!("template \"{}\": {e}", t.name))?;
         }
         for (i, p) in t.pictures.iter().enumerate() {
-            if !(0.0..=1.0).contains(&p.x) || !(0.0..=1.0).contains(&p.y) {
-                return Err(format!("template \"{}\": picture {}: x, y must be fractions 0..1 of the label", t.name, i + 1));
+            // The anchor may sit off the label — a picture is allowed to hang off the edge.
+            if !(-10.0..=11.0).contains(&p.x) || !(-10.0..=11.0).contains(&p.y) {
+                return Err(format!("template \"{}\": picture {}: x, y must be fractions of the label", t.name, i + 1));
             }
             if p.pending.is_some() {
                 return Err(format!("template \"{}\": picture {} is not baked yet", t.name, i + 1));
@@ -742,7 +741,7 @@ mod tests {
         let mut templates = builtin_templates();
         templates[0].pictures.push(logo());
         let good = format_templates(&templates).unwrap();
-        assert!(parse_templates(&good.replace("x = 1.0", "x = 1.5")).is_err(), "anchor point off the label");
+        assert!(parse_templates(&good.replace("x = 1.0", "x = 42.0")).is_err(), "anchor point far off the label");
         assert!(parse_templates(&good.replace("anchor = \"top-right\"", "anchor = \"middle\"")).is_err());
         let png = good.lines().find(|l| l.starts_with("png = ")).unwrap();
         assert!(parse_templates(&good.replace(png, "png = \"bm90IGEgcG5n\"")).is_err(), "not a PNG");

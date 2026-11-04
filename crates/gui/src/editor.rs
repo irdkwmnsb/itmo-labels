@@ -212,7 +212,8 @@ fn picture_box(p: &Picture, label: Vec2) -> Edges {
 }
 
 /// Puts the picture's top-left corner at (l, t), in fractions of the label, picking the
-/// anchor anew unless it is locked; the anchor point itself stays on the label.
+/// anchor anew unless it is locked. The picture may hang off the label (it is cut off
+/// at print), but a sliver must stay on it, so it can be grabbed and pulled back.
 fn place(p: &mut Picture, l: f32, t: f32, label: Vec2) {
     if label.x < 1.0 || label.y < 1.0 {
         return;
@@ -223,8 +224,20 @@ fn place(p: &mut Picture, l: f32, t: f32, label: Vec2) {
         p.anchor = Anchor::nearest(l + w / 2.0, t + h / 2.0);
     }
     let (ax, ay) = p.anchor.fractions();
-    p.x = (l + ax * w).clamp(0.0, 1.0);
-    p.y = (t + ay * h).clamp(0.0, 1.0);
+    let l = clamp_visible(l, w);
+    let t = clamp_visible(t, h);
+    p.x = l + ax * w;
+    p.y = t + ay * h;
+}
+
+/// How much of a picture hanging off the label must stay reachable: this fraction of the
+/// label, and never more than the picture itself (small ones stay fully on the label).
+const MIN_VISIBLE: f32 = 0.02;
+
+/// Keeps at least a sliver of a `w`-wide box (fractions of the label) on the label.
+fn clamp_visible(l: f32, w: f32) -> f32 {
+    let sliver = w.min(MIN_VISIBLE);
+    l.clamp(sliver - w, 1.0 - sliver)
 }
 
 /// Resizes a picture being placed by its corner, keeping the opposite corner of `start` still.
@@ -684,16 +697,11 @@ impl Editor {
             Some(Err(e)) => self.import_error = Some(e),
             None => {}
         }
-        // Pending pictures convert here: rate-limited while the pointer is dragging them,
-        // immediately once it is up.
-        let busy = ctx.input(|i| i.pointer.any_down());
+        // Pending pictures convert here without blocking: a worker catches the bitmap
+        // up with the settings after a drag settles.
         for e in &mut self.draft {
             for p in &mut e.template.pictures {
-                if busy {
-                    p.refresh();
-                } else {
-                    p.refresh_now();
-                }
+                p.refresh();
             }
         }
 
@@ -1177,7 +1185,8 @@ impl Editor {
         }
 
         // A picture still being placed is drawn here, live, on top of the cached label render;
-        // its frame and grips paint over the bitmap below.
+        // it may hang off the label, so both bitmap and frame paint over the whole canvas.
+        let canvas_painter = ui.painter_at(background.rect);
         let mut live: HashSet<(String, usize)> = HashSet::new();
         for (i, p) in self.draft[ti].template.pictures.iter().enumerate() {
             let Some(pending) = &p.pending else { continue };
@@ -1189,12 +1198,13 @@ impl Editor {
             }
             let texture = self.picture_textures[&key].texture.id();
             let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-            ui.painter().image(texture, rect, uv, Color32::WHITE);
+            canvas_painter.image(texture, rect, uv, Color32::WHITE);
             live.insert(key);
         }
         self.picture_textures.retain(|k, _| live.contains(k));
 
         let painter = ui.painter_at(label.expand(8.0));
+        let picture_painter = ui.painter_at(background.rect);
         let faint = Color32::from_rgba_unmultiplied(0x2f, 0x81, 0xf7, 120);
         let template = &self.draft[ti].template;
         for (i, f) in template.fields.iter().enumerate() {
@@ -1218,13 +1228,13 @@ impl Editor {
                 (false, true) => ACCENT,
                 (false, false) => faint,
             };
-            painter.rect_stroke(rect, 0.0, Stroke::new(if selected { 2.0 } else { 1.0 }, color), StrokeKind::Outside);
+            picture_painter.rect_stroke(rect, 0.0, Stroke::new(if selected { 2.0 } else { 1.0 }, color), StrokeKind::Outside);
             if p.pending.is_some() {
                 let text = format!("{} {} · {}", t.picture, i + 1, t.not_baked);
-                painter.text(rect.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, text, FontId::proportional(11.0), color);
+                picture_painter.text(rect.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, text, FontId::proportional(11.0), color);
                 if selected {
                     for (_, pos, _) in corner_grips(rect) {
-                        paint_grip(&painter, pos);
+                        paint_grip(&picture_painter, pos);
                     }
                 }
             }
@@ -1364,9 +1374,9 @@ fn picture_properties(ui: &mut Ui, t: &Tr, p: &mut Picture, label: Vec2) {
     ui.label(t.anchor_position);
     Grid::new("anchor-position").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
         ui.label("x");
-        ui.add(fraction(&mut p.x, 1.0));
+        ui.add(DragValue::new(&mut p.x).range(-10.0..=11.0).speed(0.002).max_decimals(3));
         ui.label("y");
-        ui.add(fraction(&mut p.y, 1.0));
+        ui.add(DragValue::new(&mut p.y).range(-10.0..=11.0).speed(0.002).max_decimals(3));
         ui.end_row();
     });
 
@@ -1376,6 +1386,8 @@ fn picture_properties(ui: &mut Ui, t: &Tr, p: &mut Picture, label: Vec2) {
             rotate_picture(p);
         }
         if p.pending.is_some() && ui.button(RichText::new(t.bake).strong()).clicked() {
+            // Baking freezes the bitmap: settle any conversion still running first.
+            p.refresh_now();
             p.pending = None;
         }
     });
@@ -1753,6 +1765,26 @@ mod tests {
         assert!((b.l - start.l).abs() * label.x <= 1.0 && (b.t - start.t).abs() * label.y <= 1.0, "{start:?} → {b:?}");
         assert_eq!(p.bitmap.height_px, (p.bitmap.width_px as f32 / 2.0).round() as u32);
         assert!(p.bitmap.width_px > 0 && (b.r - start.r) * label.x > 30.0);
+    }
+
+    #[test]
+    fn a_picture_can_hang_off_the_label_but_a_sliver_stays_on() {
+        let mut p = Picture {
+            x: 0.5,
+            y: 0.5,
+            anchor: Anchor::TopLeft,
+            anchor_locked: true,
+            bitmap: itmo_labels_core::label::Bitmap::blank(0.0, 0.0, 40, 20),
+            pending: None,
+        };
+        let label = Vec2::new(400.0, 200.0);
+        place(&mut p, -0.2, 0.9, label);
+        let b = picture_box(&p, label);
+        assert!((b.l + 0.08).abs() < 1e-6 && (b.t - 0.9).abs() < 1e-6, "{b:?}");
+        assert!(b.r > 0.0 && b.b <= 1.0, "a sliver stays on the label: {b:?}");
+        place(&mut p, -5.0, 5.0, label);
+        let b = picture_box(&p, label);
+        assert!(b.r > 0.0 && b.t < 1.0, "cannot be pushed completely off: {b:?}");
     }
 
     #[test]

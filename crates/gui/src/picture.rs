@@ -102,39 +102,66 @@ impl Source {
 
 /// Resizes the flattened ink to the asked width and turns it into dots.
 fn convert(source: &Source, ink: &GrayImage, s: &Settings) -> Bitmap {
-    let width = s.width_px.max(1);
-    let height = source.height_for(width);
-    let ink = imageops::resize(ink, width, height, imageops::FilterType::Triangle);
-    match s.mode {
-        Mode::Threshold => Bitmap::from_fn(0.0, 0.0, width, height, |x, y| ink.get_pixel(x, y).0[0] >= s.threshold.max(1)),
-        Mode::Dither => {
-            let dots = dither(&ink);
-            Bitmap::from_fn(0.0, 0.0, width, height, |x, y| dots[(y * width + x) as usize])
-        }
-    }
+    let (sw, sh) = source.size();
+    convert_dims(sw, sh, ink, s)
 }
 
-/// Floyd–Steinberg: each dot's rounding error is pushed on to the neighbours not yet drawn.
-fn dither(ink: &GrayImage) -> Vec<bool> {
-    let (w, h) = (ink.width() as usize, ink.height() as usize);
-    let mut level: Vec<f32> = ink.pixels().map(|p| p.0[0] as f32).collect();
+/// Everything a conversion needs, so it can also run on a worker thread.
+fn convert_dims(sw: u32, sh: u32, ink: &GrayImage, s: &Settings) -> Bitmap {
+    let width = s.width_px.max(1);
+    let height = (width as f32 * sh as f32 / sw as f32).round().max(1.0) as u32;
+    let ink = imageops::resize(ink, width, height, imageops::FilterType::Triangle);
+    let (w, h) = (width as usize, height as usize);
+    let mut bitmap = Bitmap::blank(0.0, 0.0, width, height);
+    let row_bytes = bitmap.row_bytes();
+    match s.mode {
+        Mode::Threshold => {
+            let threshold = s.threshold.max(1);
+            for (row, pixels) in bitmap.data.chunks_mut(row_bytes).zip(ink.as_raw().chunks(w)) {
+                for (x, &v) in pixels.iter().enumerate() {
+                    if v >= threshold {
+                        row[x / 8] |= 0x80 >> (x % 8);
+                    }
+                }
+            }
+        }
+        Mode::Dither => {
+            for (row, dots) in bitmap.data.chunks_mut(row_bytes).zip(dither(ink.as_raw(), w, h).chunks(w)) {
+                for (x, &dot) in dots.iter().enumerate() {
+                    if dot {
+                        row[x / 8] |= 0x80 >> (x % 8);
+                    }
+                }
+            }
+        }
+    }
+    bitmap
+}
+
+/// Floyd–Steinberg over raw grey pixels: each dot's rounding error is pushed on to the
+/// neighbours not yet drawn.
+fn dither(pixels: &[u8], w: usize, h: usize) -> Vec<bool> {
+    let mut level: Vec<f32> = pixels.iter().map(|&v| v as f32).collect();
     let mut dots = vec![false; w * h];
     for y in 0..h {
+        let row = y * w;
         for x in 0..w {
-            let i = y * w + x;
+            let i = row + x;
             let black = level[i] >= 128.0;
             dots[i] = black;
             let err = level[i] - if black { 255.0 } else { 0.0 };
-            let mut push = |dx: isize, dy: usize, share: f32| {
-                let nx = x as isize + dx;
-                if nx >= 0 && (nx as usize) < w && y + dy < h {
-                    level[(y + dy) * w + nx as usize] += err * share;
+            if x + 1 < w {
+                level[i + 1] += err * 7.0 / 16.0;
+            }
+            if y + 1 < h {
+                if x > 0 {
+                    level[i + w - 1] += err * 3.0 / 16.0;
                 }
-            };
-            push(1, 0, 7.0 / 16.0);
-            push(-1, 1, 3.0 / 16.0);
-            push(0, 1, 5.0 / 16.0);
-            push(1, 1, 1.0 / 16.0);
+                level[i + w] += err * 5.0 / 16.0;
+                if x + 1 < w {
+                    level[i + w + 1] += err * 1.0 / 16.0;
+                }
+            }
         }
     }
     dots
@@ -143,8 +170,9 @@ fn dither(ink: &GrayImage) -> Vec<bool> {
 /// A picture still being placed: its file and how it is converted right now.
 ///
 /// The full-resolution ink is flattened once and shared between undo steps (`Arc`);
-/// the bitmap next to it is rebuilt from that ink when the settings change, at most
-/// every `CONVERT_MIN_INTERVAL` while they keep changing (a dragged slider or corner).
+/// the bitmap next to it is rebuilt from that ink when the settings change. The rebuild
+/// runs on a worker thread (desktop) or rate-limited inline (web), so dragging a slider
+/// or corner stays smooth even though a large dither takes a while.
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub source: Source,
@@ -155,11 +183,24 @@ pub struct Pending {
     ink: Arc<GrayImage>,
     ink_invert: bool,
     converted_at: Instant,
+    /// The conversion running on a worker thread, if any.
+    #[cfg(not(target_arch = "wasm32"))]
+    job: Option<Job>,
+}
+
+/// Desktop only: a conversion running off the UI thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+struct Job {
+    /// What the worker converts; the bitmap may lag `settings` while it runs.
+    settings: Settings,
+    done: Arc<Mutex<Option<Bitmap>>>,
 }
 
 impl PartialEq for Pending {
     fn eq(&self, other: &Self) -> bool {
-        // `ink` is derived from the source and `invert`; `converted_at` does not change the look.
+        // `ink` is derived from the source and `invert`; `converted_at` and `job`
+        // are just how the bitmap catches up with the settings.
         self.source == other.source && self.settings == other.settings && self.made == other.made
     }
 }
@@ -168,17 +209,106 @@ impl Pending {
     pub fn new(source: Source, settings: Settings) -> (Self, Bitmap) {
         let ink = Arc::new(source.flatten_ink(settings.invert));
         let bitmap = convert(&source, &ink, &settings);
-        (Self { source, settings, made: settings, ink_invert: settings.invert, ink, converted_at: Instant::now() }, bitmap)
+        (
+            Self {
+                source,
+                settings,
+                made: settings,
+                ink_invert: settings.invert,
+                ink,
+                converted_at: Instant::now(),
+                #[cfg(not(target_arch = "wasm32"))]
+                job: None,
+            },
+            bitmap,
+        )
     }
 
-    /// The bitmap for the current settings, refreshing the cached ink if `invert` changed.
-    pub fn convert(&mut self) -> Bitmap {
+    /// The ink matching the current `invert`, refreshing the cache if it changed.
+    fn ink_current(&mut self) -> Arc<GrayImage> {
         if self.ink_invert != self.settings.invert {
             self.ink = Arc::new(self.source.flatten_ink(self.settings.invert));
             self.ink_invert = self.settings.invert;
         }
+        self.ink.clone()
+    }
+
+    /// The bitmap for the current settings, refreshing the cached ink if `invert` changed.
+    pub fn convert(&mut self) -> Bitmap {
+        let ink = self.ink_current();
+        let (sw, sh) = self.source.size();
         self.converted_at = Instant::now();
-        convert(&self.source, &self.ink, &self.settings)
+        convert_dims(sw, sh, &ink, &self.settings)
+    }
+
+    /// Converts the current settings without blocking the UI: on a worker thread on
+    /// desktop, inline but rate-limited on the web. Returns the bitmap to show once a
+    /// conversion finishes; it may be a step behind while the settings keep changing.
+    pub fn refresh(&mut self) -> Option<Bitmap> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let done = self
+                .job
+                .as_ref()
+                .and_then(|job| job.done.lock().unwrap().take().map(|bitmap| (job.settings, bitmap)));
+            if let Some((settings, bitmap)) = done {
+                self.job = None;
+                self.converted_at = Instant::now();
+                self.made = settings;
+                return Some(bitmap);
+            }
+            if self.job.is_none() && self.made != self.settings && self.due() {
+                let ink = self.ink_current();
+                let (sw, sh) = self.source.size();
+                let settings = self.settings;
+                let done = Arc::new(Mutex::new(None));
+                std::thread::spawn({
+                    let done = done.clone();
+                    move || *done.lock().unwrap() = Some(convert_dims(sw, sh, &ink, &settings))
+                });
+                self.converted_at = Instant::now();
+                self.job = Some(Job { settings, done });
+            }
+            None
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.made != self.settings && self.due() {
+                self.made = self.settings;
+                return Some(self.convert());
+            }
+            None
+        }
+    }
+
+    /// Converts the current settings now, waiting for a worker that has them underway.
+    /// Returns the bitmap to show, if the settings changed since the last conversion.
+    pub fn refresh_now(&mut self) -> Option<Bitmap> {
+        if self.made == self.settings {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.job = None;
+            }
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(job) = self.job.take()
+                && job.settings == self.settings
+            {
+                let bitmap = loop {
+                    if let Some(bitmap) = job.done.lock().unwrap().take() {
+                        break bitmap;
+                    }
+                    std::thread::yield_now();
+                };
+                self.converted_at = Instant::now();
+                self.made = self.settings;
+                return Some(bitmap);
+            }
+        }
+        self.made = self.settings;
+        Some(self.convert())
     }
 
     /// A quarter turn: the source, the cached ink and the width follow it.
@@ -188,13 +318,15 @@ impl Pending {
         self.ink = Arc::new(imageops::rotate90(&*self.ink));
     }
 
-    /// What the bitmap was made from: settings plus source identity, for cache versioning.
+    /// What the bitmap next to the picture was made from, for cache versioning: the
+    /// finished conversion's settings plus the source identity. While a conversion is
+    /// still running this lags `settings`, so a stale bitmap is not re-uploaded.
     pub fn version(&self) -> (Settings, usize) {
-        (self.settings, self.source.ptr())
+        (self.made, self.source.ptr())
     }
 
-    /// Whether a rate-limited refresh may run now.
-    pub fn due(&self) -> bool {
+    /// Whether a new conversion may start now.
+    fn due(&self) -> bool {
         self.converted_at.elapsed() >= CONVERT_MIN_INTERVAL
     }
 }
