@@ -1,5 +1,7 @@
 //! UI strings.
 
+use itmo_labels_core::render::QrError;
+
 use crate::config::Lang;
 
 // Some strings belong to native-only parts: server mode, the editor's window title.
@@ -51,6 +53,13 @@ pub struct Tr {
     pub name: &'static str,
     pub sample: &'static str,
     pub sample_hint: &'static str,
+    pub field_type: &'static str,
+    pub text_field: &'static str,
+    pub qr_padding: &'static str,
+    pub qr_padding_hint: &'static str,
+    pub qr_too_long: &'static str,
+    pub qr_zone_too_small: &'static str,
+    pub qr_overlap: &'static str,
     pub default_orientation: &'static str,
     pub not_set: &'static str,
     pub zone: &'static str,
@@ -196,6 +205,13 @@ pub const RU: Tr = Tr {
     name: "Название",
     sample: "Пример текста",
     sample_hint: "Виден в редакторе и серым в пустом поле ввода",
+    field_type: "Тип поля",
+    text_field: "Текст",
+    qr_padding: "Padding",
+    qr_padding_hint: "Добавить белую рамку шириной в четыре модуля",
+    qr_too_long: "Текст слишком длинный для QR-кода",
+    qr_zone_too_small: "QR-код не помещается в зону. Увеличьте зону или сократите текст.",
+    qr_overlap: "QR-коды пересекаются. Раздвиньте их в шаблоне.",
     default_orientation: "Ориентация по умолчанию",
     not_set: "Не задана",
     zone: "Зона, доли рабочей области",
@@ -337,6 +353,13 @@ pub const EN: Tr = Tr {
     name: "Name",
     sample: "Sample text",
     sample_hint: "Shown in the editor and greyed out in the empty input box",
+    field_type: "Field type",
+    text_field: "Text",
+    qr_padding: "Padding",
+    qr_padding_hint: "Add a white border four modules wide",
+    qr_too_long: "Text is too long for a QR code",
+    qr_zone_too_small: "The QR code does not fit. Enlarge the zone or shorten the text.",
+    qr_overlap: "QR codes overlap. Move them apart in the template.",
     default_orientation: "Default orientation",
     not_set: "Not set",
     zone: "Zone, fractions of the printable area",
@@ -444,6 +467,14 @@ fn en_plural(n: u64) -> usize {
 }
 
 impl Tr {
+    pub fn qr_error(&self, error: QrError) -> &'static str {
+        match error {
+            QrError::DataTooLong => self.qr_too_long,
+            QrError::ZoneTooSmall => self.qr_zone_too_small,
+            QrError::Overlap => self.qr_overlap,
+        }
+    }
+
     /// "labels" agreeing with `n`.
     pub fn labels(&self, n: u64) -> &'static str {
         self.labels[(self.plural)(n)]

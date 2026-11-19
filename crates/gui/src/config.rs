@@ -68,10 +68,15 @@ const TEMPLATES_HEADER: &str = r#"# Label templates for ITMO Labels. This file i
 # name        — shown in the list; also the key under which the app remembers its texts
 # orientation — optional, "portrait" or "landscape": used the first time the template is picked
 #
-# [[template.field]] — a text, auto-sized to fit its zone
+# [[template.field]] — text or a QR code generated from the field's input
 # name   — label of the input box
+# type   — "text" (default) or "qr"
 # x, y   — top-left corner of the zone, as fractions (0..1) of the label inside its 2 mm margins
 # w, h   — size of the zone, same units; default 1
+# padding — QR only, true (default) adds a white border four modules wide
+# sample — optional example text, shown in the editor and as a hint in the input box
+#
+# Text fields also accept these options
 # align  — "left", "center" (default) or "right"
 # bold   — true or false (default)
 # max_pt — optional upper limit on the font size, in points
@@ -79,7 +84,6 @@ const TEMPLATES_HEADER: &str = r#"# Label templates for ITMO Labels. This file i
 #          between texts; "ink": centre by the letters actually drawn, for the largest text
 # wrap   — true: break the text into lines at spaces when that makes it larger; false (default):
 #          always one line
-# sample — optional example text: the editor previews it, the input box shows it greyed out
 #
 # [[template.picture]] — a 1-bit image, printed dot for dot: the same size on every label
 # x, y          — where its anchor point goes, as fractions (0..1) of the whole label
@@ -421,11 +425,31 @@ impl Picture {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    #[default]
+    Text,
+    Qr,
+}
+
+fn default_padding() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// Defaults are left out when written, so a saved file reads like a hand-written one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
     pub name: String,
+    #[serde(rename = "type", default, skip_serializing_if = "is_default")]
+    pub kind: FieldKind,
+    #[serde(default = "default_padding", skip_serializing_if = "is_true")]
+    pub padding: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sample: String,
     #[serde(default, skip_serializing_if = "is_zero", serialize_with = "rounded")]
@@ -452,6 +476,8 @@ impl Default for Field {
     fn default() -> Self {
         Self {
             name: String::new(),
+            kind: FieldKind::Text,
+            padding: default_padding(),
             sample: String::new(),
             x: 0.0,
             y: 0.0,
@@ -676,6 +702,32 @@ mod tests {
         assert_eq!((badge.fields[2].x, badge.fields[2].w), (0.0, 1.0), "defaults fill the width");
         assert_eq!(badge.fields[2].h, badge.fields[3].h, "team and university get the same room");
         assert_eq!(t[0].fields[0].fit, FieldFit::Ink);
+    }
+
+    #[test]
+    fn qr_fields_round_trip_with_optional_padding() {
+        let templates = parse_templates(r#"
+[[template]]
+name = "Mixed"
+
+[[template.field]]
+name = "Text"
+
+[[template.field]]
+name = "Padded"
+type = "qr"
+
+[[template.field]]
+name = "Bare"
+type = "qr"
+padding = false
+"#).unwrap();
+        let fields = &templates[0].fields;
+        assert_eq!(fields[0].kind, FieldKind::Text);
+        assert_eq!(fields[1].kind, FieldKind::Qr);
+        assert!(fields[1].padding);
+        assert!(!fields[2].padding);
+        assert_eq!(parse_templates(&format_templates(&templates).unwrap()).unwrap(), templates);
     }
 
     #[test]

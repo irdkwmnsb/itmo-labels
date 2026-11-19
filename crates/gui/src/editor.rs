@@ -15,7 +15,7 @@ use itmo_labels_core::render::{MARGIN_MM, Rendered};
 
 use crate::{
     app::{self, DPI, Fonts, RenderKey, pending_fresh, pending_update},
-    config::{Anchor, Field, FieldAlign, FieldFit, Orientation, Picture, Size, Template, TemplatesWriter},
+    config::{Anchor, Field, FieldAlign, FieldFit, FieldKind, Orientation, Picture, Size, Template, TemplatesWriter},
     i18n::Tr,
     picture::{FilePicker, Mode, Pending, Settings, Source},
 };
@@ -924,6 +924,11 @@ impl Editor {
         ui.label(RichText::new(t.field).strong());
         ui.label(t.name);
         name_input(ui, &mut f.name, problems.fields.get(&(entry.id, fi)).copied(), t);
+        ui.label(t.field_type);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut f.kind, FieldKind::Text, t.text_field);
+            ui.selectable_value(&mut f.kind, FieldKind::Qr, "QR");
+        });
         ui.label(t.sample).on_hover_text(t.sample_hint);
         let hint = f.name.clone();
         ui.add(TextEdit::singleline(&mut f.sample).hint_text(hint).desired_width(f32::INFINITY));
@@ -946,6 +951,10 @@ impl Editor {
         });
 
         ui.add_space(6.0);
+        if f.kind == FieldKind::Qr {
+            ui.checkbox(&mut f.padding, t.qr_padding).on_hover_text(t.qr_padding_hint);
+            return;
+        }
         ui.label(t.align);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut f.align, FieldAlign::Left, t.align_left);
@@ -1036,7 +1045,11 @@ impl Editor {
         template.pictures.retain(|p| p.pending.is_none());
         let texts = template.fields.iter().map(|f| if f.sample.is_empty() { f.name.clone() } else { f.sample.clone() }).collect();
         self.rerender(ui.ctx(), fonts, RenderKey { size, template, orientation: self.orientation, texts });
-        let Some((_, r, texture)) = &self.rendered else { return };
+        let Some((key, r, texture)) = &self.rendered else { return };
+        for &(field, error) in &r.qr_errors {
+            let name = &key.template.fields[field].name;
+            ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {}", t.qr_error(error)));
+        }
         let px = Vec2::new(r.preview.width_px as f32, r.preview.height_px as f32);
         let texture = texture.clone();
 
@@ -1200,6 +1213,11 @@ impl Editor {
             let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
             canvas_painter.image(texture, rect, uv, Color32::WHITE);
             live.insert(key);
+        }
+        if !live.is_empty()
+            && let Some((_, rendered, texture)) = &self.rendered
+        {
+            app::paint_qr_layer(&canvas_painter, label, texture, rendered);
         }
         self.picture_textures.retain(|k, _| live.contains(k));
 

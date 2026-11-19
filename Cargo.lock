@@ -1278,6 +1278,7 @@ dependencies = [
  "ab_glyph",
  "libc",
  "nusb",
+ "qrcode",
  "windows-sys 0.61.2",
 ]
 

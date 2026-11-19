@@ -1,10 +1,7 @@
-//! Host-side text rasterisation: any Unicode text in any TTF/OTF font becomes a 1-bit
-//! bitmap in printer dots, so labels do not depend on the printer's built-in fonts.
-//!
-//! A label is a set of text fields, each auto-sized independently into its own zone,
-//! on one line or word-wrapped onto several, plus pictures of a fixed size in dots.
+//! Host-side rasterisation of text, QR codes and pictures into a 1-bit label bitmap.
 
 use ab_glyph::{Font, FontRef, Glyph, PxScale, Rect, ScaleFont, point};
+use qrcode::{Color, EcLevel, QrCode, Version, bits::Bits};
 
 use crate::label::{Bitmap, Element, Label};
 
@@ -12,6 +9,8 @@ use crate::label::{Bitmap, Element, Label};
 pub const MARGIN_MM: f32 = 2.0;
 /// Coverage at or above which an anti-aliased pixel becomes a burnt dot.
 const INK_THRESHOLD: f32 = 0.5;
+const QR_PADDING_MODULES: u32 = 4;
+const QR_MIN_MODULE_DOTS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Orientation {
@@ -66,6 +65,32 @@ pub struct TextField<'a> {
     pub wrap: bool,
 }
 
+pub enum Field<'a> {
+    Text(TextField<'a>),
+    Qr { text: &'a str, zone: Zone, padding: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrError {
+    DataTooLong,
+    ZoneTooSmall,
+    Overlap,
+}
+
+/// Square occupied by a QR code in the preview bitmap, including any padding.
+pub struct QrBounds {
+    pub x: u32,
+    pub y: u32,
+    pub side: u32,
+}
+
+impl QrBounds {
+    fn overlaps(&self, other: &Self) -> bool {
+        self.x < other.x + other.side && other.x < self.x + self.side
+            && self.y < other.y + other.side && other.y < self.y + self.side
+    }
+}
+
 /// A ready 1-bit image, drawn dot for dot whatever the label size; anything past the
 /// label's edge is cut off. Margins do not apply.
 pub struct Picture<'a> {
@@ -94,7 +119,7 @@ pub struct LabelSpec<'a> {
     pub gap_mm: f32,
     pub dpi: u32,
     pub orientation: Orientation,
-    pub fields: &'a [TextField<'a>],
+    pub fields: &'a [Field<'a>],
     pub pictures: &'a [Picture<'a>],
 }
 
@@ -103,8 +128,11 @@ pub struct Rendered {
     pub label: Label,
     /// The same pixels as the reader sees them (rotated back if the lines were turned).
     pub preview: Bitmap,
-    /// Size each field ended up with; `None` for empty fields.
+    /// Text size by field index; `None` for empty or QR fields.
     pub sizes_pt: Vec<Option<f32>>,
+    /// QR fields that could not be drawn, identified by field index.
+    pub qr_errors: Vec<(usize, QrError)>,
+    pub qr_bounds: Vec<QrBounds>,
 }
 
 fn dots(mm: f32, dpi: u32) -> u32 {
@@ -284,6 +312,77 @@ fn draw_picture(canvas: &mut Bitmap, picture: &Picture) {
     }
 }
 
+fn encode_qr(text: &str) -> Result<QrCode, QrError> {
+    // Even a version 40 QR code with the lowest error correction holds at most
+    // 7089 digits, the densest possible encoding.
+    if text.len() > 7089 {
+        return Err(QrError::DataTooLong);
+    }
+    if text.is_ascii() {
+        return QrCode::new(text).map_err(|_| QrError::DataTooLong);
+    }
+
+    // Mark byte-mode content as UTF-8 so the scanner can decode it correctly.
+    let level = EcLevel::M;
+    for version in 1..=40 {
+        let mut bits = Bits::new(Version::Normal(version));
+        if bits.push_eci_designator(26).is_ok()
+            && bits.push_byte_data(text.as_bytes()).is_ok()
+            && bits.push_terminator(level).is_ok()
+        {
+            return QrCode::with_bits(bits, level).map_err(|_| QrError::DataTooLong);
+        }
+    }
+    Err(QrError::DataTooLong)
+}
+
+fn draw_qr(
+    canvas: &mut Bitmap,
+    text: &str,
+    zone: Rect,
+    padding: bool,
+    occupied: &mut Vec<QrBounds>,
+) -> Result<(), QrError> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let code = encode_qr(text)?;
+    let padding = if padding { QR_PADDING_MODULES } else { 0 };
+    let width = code.width() as u32;
+    let modules = width + 2 * padding;
+    // Fit the square inside the zone using whole printer dots for each module.
+    let left = zone.min.x.ceil() as u32;
+    let top = zone.min.y.ceil() as u32;
+    let available_w = (zone.max.x.floor() as u32).min(canvas.width_px).saturating_sub(left);
+    let available_h = (zone.max.y.floor() as u32).min(canvas.height_px).saturating_sub(top);
+    let scale = available_w.min(available_h) / modules;
+    if scale < QR_MIN_MODULE_DOTS {
+        return Err(QrError::ZoneTooSmall);
+    }
+    let side = modules * scale;
+    let ox = left + (available_w - side) / 2;
+    let oy = top + (available_h - side) / 2;
+    let bounds = QrBounds { x: ox, y: oy, side };
+    if occupied.iter().any(|other| bounds.overlaps(other)) {
+        return Err(QrError::Overlap);
+    }
+    let first = padding * scale;
+    let ink = first..first + width * scale;
+    for y in 0..side {
+        for x in 0..side {
+            let dark = ink.contains(&x) && ink.contains(&y)
+                && code[(((x - first) / scale) as usize, ((y - first) / scale) as usize)] == Color::Dark;
+            if dark {
+                canvas.set(ox + x, oy + y);
+            } else {
+                canvas.clear(ox + x, oy + y);
+            }
+        }
+    }
+    occupied.push(bounds);
+    Ok(())
+}
+
 pub fn render(spec: &LabelSpec) -> Rendered {
     let (across, along) = (dots(spec.width_mm, spec.dpi), dots(spec.height_mm, spec.dpi));
     // Lines run across the head unless the chosen orientation wants the other side.
@@ -300,18 +399,28 @@ pub fn render(spec: &LabelSpec) -> Rendered {
     for picture in spec.pictures {
         draw_picture(&mut canvas, picture);
     }
+    let pixel_zone = |z: Zone| Rect {
+        min: point(margin + z.x * content_w, margin + z.y * content_h),
+        max: point(margin + (z.x + z.w) * content_w, margin + (z.y + z.h) * content_h),
+    };
     let sizes_pt = spec
         .fields
         .iter()
-        .map(|field| {
-            let z = field.zone;
-            let zone = Rect {
-                min: point(margin + z.x * content_w, margin + z.y * content_h),
-                max: point(margin + (z.x + z.w) * content_w, margin + (z.y + z.h) * content_h),
-            };
-            draw_field(&mut canvas, field, zone, spec.dpi)
+        .map(|field| match field {
+            Field::Text(field) => draw_field(&mut canvas, field, pixel_zone(field.zone), spec.dpi),
+            Field::Qr { .. } => None,
         })
         .collect();
+    // QR light modules and the quiet zone cover text and pictures beneath them.
+    let mut qr_errors = Vec::new();
+    let mut qr_bounds = Vec::new();
+    for (i, field) in spec.fields.iter().enumerate() {
+        if let Field::Qr { text, zone, padding } = field
+            && let Err(error) = draw_qr(&mut canvas, text, pixel_zone(*zone), *padding, &mut qr_bounds)
+        {
+            qr_errors.push((i, error));
+        }
+    }
 
     let printed = if rotate { canvas.rotated_cw() } else { canvas.clone() };
     Rendered {
@@ -323,6 +432,8 @@ pub fn render(spec: &LabelSpec) -> Rendered {
         },
         preview: canvas,
         sizes_pt,
+        qr_errors,
+        qr_bounds,
     }
 }
 
@@ -335,7 +446,7 @@ mod tests {
         TextField { text, font, zone, align: Align::Center, fit, max_pt: None, wrap: false }
     }
 
-    fn spec<'a>(fields: &'a [TextField<'a>], w: f32, h: f32, orientation: Orientation) -> LabelSpec<'a> {
+    fn spec<'a>(fields: &'a [Field<'a>], w: f32, h: f32, orientation: Orientation) -> LabelSpec<'a> {
         LabelSpec { width_mm: w, height_mm: h, gap_mm: 2.0, dpi: 203, orientation, fields, pictures: &[] }
     }
 
@@ -344,6 +455,51 @@ mod tests {
             [Element::Bitmap(b)] => b,
             _ => panic!("expected one bitmap"),
         }
+    }
+
+    #[test]
+    fn qr_padding_clears_the_background_and_can_be_disabled() {
+        let background = Bitmap::from_fn(0.0, 0.0, 100, 110, |_, _| true);
+        let pictures = [Picture { bitmap: &background, at: (0.0, 0.0), anchor: (0.0, 0.0) }];
+        let render_qr = |padding| {
+            let fields = [Field::Qr { text: "ABC", zone: Zone::FULL, padding }];
+            render(&LabelSpec {
+                pictures: &pictures,
+                ..spec(&fields, 12.5, 13.75, Orientation::Portrait)
+            })
+        };
+        let padded = render_qr(true);
+        assert!(padded.qr_errors.is_empty());
+        assert!(!padded.preview.get(21, 26), "white border covers the picture");
+        assert!(padded.preview.get(29, 34), "black finder corner");
+        assert!(!padded.preview.get(31, 36), "white ring of the finder");
+        let bare = render_qr(false);
+        assert!(bare.preview.get(18, 23), "finder starts at the top left");
+        assert!(!bare.preview.get(21, 26), "white ring, with no padding");
+    }
+
+    #[test]
+    fn qr_reports_the_reason_it_cannot_render() {
+        let long = "x".repeat(8000);
+        let small = Zone { w: 0.01, ..Zone::FULL };
+        let fields = [
+            Field::Qr { text: "", zone: small, padding: true },
+            Field::Qr { text: "ABC", zone: small, padding: true },
+            Field::Qr { text: &long, zone: Zone::FULL, padding: true },
+        ];
+        let result = render(&spec(&fields, 50.0, 70.0, Orientation::Portrait));
+        assert!(result.preview.data.iter().all(|&byte| byte == 0));
+        assert_eq!(result.qr_errors, [(1, QrError::ZoneTooSmall), (2, QrError::DataTooLong)]);
+    }
+
+    #[test]
+    fn overlapping_qr_codes_report_an_error() {
+        let fields = [
+            Field::Qr { text: "One", zone: Zone { w: 0.6, ..Zone::FULL }, padding: true },
+            Field::Qr { text: "Two", zone: Zone { x: 0.4, w: 0.6, ..Zone::FULL }, padding: true },
+        ];
+        let result = render(&spec(&fields, 50.0, 70.0, Orientation::Portrait));
+        assert_eq!(result.qr_errors, [(1, QrError::Overlap)], "printing both would damage the first QR");
     }
 
     /// Ink bounds as (x0, y0, x1, y1), inclusive, optionally limited to rows y_from..y_to.
@@ -363,7 +519,7 @@ mod tests {
     #[test]
     fn printer_bitmap_always_matches_stock() {
         let font = fonts::regular();
-        let fields = [field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink)];
+        let fields = [Field::Text(field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink))];
         for (w, h) in [(50.0, 70.0), (70.0, 50.0)] {
             for o in [Orientation::Portrait, Orientation::Landscape] {
                 let b = printed(&render(&spec(&fields, w, h, o))).clone();
@@ -376,7 +532,7 @@ mod tests {
     fn same_physical_label_regardless_of_roll_direction() {
         // 50×70 and 70×50 are the same label wound differently: the reader sees the same thing.
         let font = fonts::regular();
-        let fields = [field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink)];
+        let fields = [Field::Text(field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink))];
         for o in [Orientation::Portrait, Orientation::Landscape] {
             let a = render(&spec(&fields, 50.0, 70.0, o));
             let b = render(&spec(&fields, 70.0, 50.0, o));
@@ -387,7 +543,7 @@ mod tests {
     #[test]
     fn portrait_reads_along_short_side() {
         let font = fonts::regular();
-        let fields = [field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink)];
+        let fields = [Field::Text(field(&font, "Привет, ITMO", Zone::FULL, Fit::Ink))];
         let r = render(&spec(&fields, 70.0, 50.0, Orientation::Portrait));
         assert!(r.preview.width_px < r.preview.height_px);
         let (x0, _, x1, _) = ink_box(&r.preview, 0..u32::MAX).unwrap();
@@ -398,7 +554,7 @@ mod tests {
     fn fields_stay_inside_margins() {
         let font = fonts::regular();
         for fit in [Fit::Ink, Fit::Line] {
-            let fields = [field(&font, "Йцукен gjpq", Zone::FULL, fit)];
+            let fields = [Field::Text(field(&font, "Йцукен gjpq", Zone::FULL, fit))];
             let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
             let m = dots(MARGIN_MM, 203);
             let (x0, y0, x1, y1) = ink_box(&r.preview, 0..u32::MAX).unwrap();
@@ -412,7 +568,7 @@ mod tests {
         let font = fonts::regular();
         let zone = Zone { x: 0.0, y: 0.3, w: 1.0, h: 0.3 };
         let bottom = |text: &str| {
-            let fields = [field(&font, text, zone, Fit::Line)];
+            let fields = [Field::Text(field(&font, text, zone, Fit::Line))];
             let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
             ink_box(&r.preview, 0..u32::MAX).unwrap().3
         };
@@ -423,9 +579,9 @@ mod tests {
     fn each_field_sized_independently_in_its_zone() {
         let font = fonts::regular();
         let fields = [
-            field(&font, "Иван Иванов", Zone { x: 0.0, y: 0.18, w: 1.0, h: 0.32 }, Fit::Line),
-            field(&font, "QA", Zone { x: 0.0, y: 0.53, w: 1.0, h: 0.19 }, Fit::Line),
-            field(&font, "", Zone { x: 0.0, y: 0.84, w: 1.0, h: 0.16 }, Fit::Line),
+            Field::Text(field(&font, "Иван Иванов", Zone { x: 0.0, y: 0.18, w: 1.0, h: 0.32 }, Fit::Line)),
+            Field::Text(field(&font, "QA", Zone { x: 0.0, y: 0.53, w: 1.0, h: 0.19 }, Fit::Line)),
+            Field::Text(field(&font, "", Zone { x: 0.0, y: 0.84, w: 1.0, h: 0.16 }, Fit::Line)),
         ];
         let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
         assert!(r.sizes_pt[0].is_some() && r.sizes_pt[1].is_some());
@@ -439,7 +595,7 @@ mod tests {
     #[test]
     fn max_pt_caps_size() {
         let font = fonts::regular();
-        let fields = [TextField { max_pt: Some(10.0), ..field(&font, "A", Zone::FULL, Fit::Line) }];
+        let fields = [Field::Text(TextField { max_pt: Some(10.0), ..field(&font, "A", Zone::FULL, Fit::Line) })];
         let r = render(&spec(&fields, 50.0, 70.0, Orientation::Portrait));
         assert!(r.sizes_pt[0].unwrap() <= 10.0 + 1e-3);
     }
@@ -449,8 +605,8 @@ mod tests {
         let font = fonts::regular();
         let m = dots(MARGIN_MM, 203);
         let zone = Zone { x: 0.0, y: 0.0, w: 1.0, h: 0.2 };
-        let left = [TextField { align: Align::Left, ..field(&font, "ab", zone, Fit::Line) }];
-        let right = [TextField { align: Align::Right, ..field(&font, "ab", zone, Fit::Line) }];
+        let left = [Field::Text(TextField { align: Align::Left, ..field(&font, "ab", zone, Fit::Line) })];
+        let right = [Field::Text(TextField { align: Align::Right, ..field(&font, "ab", zone, Fit::Line) })];
         let l = render(&spec(&left, 50.0, 70.0, Orientation::Landscape));
         let r = render(&spec(&right, 50.0, 70.0, Orientation::Landscape));
         let (lx0, ..) = ink_box(&l.preview, 0..u32::MAX).unwrap();
@@ -476,8 +632,8 @@ mod tests {
     #[test]
     fn wrap_breaks_at_spaces_when_that_is_larger() {
         let font = fonts::regular();
-        let one = [field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line)];
-        let two = [TextField { wrap: true, ..field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line) }];
+        let one = [Field::Text(field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line))];
+        let two = [Field::Text(TextField { wrap: true, ..field(&font, "Константинопольский Иван", Zone::FULL, Fit::Line) })];
         let one = render(&spec(&one, 50.0, 70.0, Orientation::Landscape));
         let two = render(&spec(&two, 50.0, 70.0, Orientation::Landscape));
         assert_eq!(ink_rows(&one.preview).len(), 1);
@@ -490,7 +646,7 @@ mod tests {
         let font = fonts::regular();
         // A wide, low zone: two lines would have to be half as tall.
         let zone = Zone { x: 0.0, y: 0.0, w: 1.0, h: 0.2 };
-        let fields = [TextField { wrap: true, ..field(&font, "Ян Ли", zone, Fit::Line) }];
+        let fields = [Field::Text(TextField { wrap: true, ..field(&font, "Ян Ли", zone, Fit::Line) })];
         let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
         assert_eq!(ink_rows(&r.preview).len(), 1);
     }
@@ -500,7 +656,7 @@ mod tests {
         let font = fonts::bold();
         let zone = Zone { x: 0.0, y: 0.35, w: 1.0, h: 0.65 };
         for fit in [Fit::Line, Fit::Ink] {
-            let fields = [TextField { wrap: true, ..field(&font, "Римский-Корсаков Николай Андреевич", zone, fit) }];
+            let fields = [Field::Text(TextField { wrap: true, ..field(&font, "Римский-Корсаков Николай Андреевич", zone, fit) })];
             let r = render(&spec(&fields, 50.0, 70.0, Orientation::Landscape));
             let m = dots(MARGIN_MM, 203);
             let content_h = r.preview.height_px as f32 - 2.0 * m as f32;
