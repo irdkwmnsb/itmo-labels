@@ -19,7 +19,7 @@ use itmo_labels_core::{
 
 use crate::{
     batch::{Batch, ONE_BY_ONE, Outcome, Reason},
-    config::{self, Lang, Orientation, Size, Source, State, Template},
+    config::{self, FieldKind, Lang, Orientation, Size, Source, State, Template},
     editor::{self, Editor},
     i18n::{Tr, tr},
     picture::Settings,
@@ -64,19 +64,25 @@ impl RenderKey {
 
     /// The same label with other texts, one per field.
     fn render_with(&self, texts: &[String], fonts: &Fonts) -> Rendered {
-        let fields: Vec<TextField> = self
+        let fields: Vec<_> = self
             .template
             .fields
             .iter()
             .zip(texts)
-            .map(|(f, text)| TextField {
-                text,
-                font: if f.bold { &fonts.bold } else { &fonts.regular },
-                zone: Zone { x: f.x, y: f.y, w: f.w, h: f.h },
-                align: f.align.into(),
-                fit: f.fit.into(),
-                max_pt: f.max_pt,
-                wrap: f.wrap,
+            .map(|(f, text)| {
+                let zone = Zone { x: f.x, y: f.y, w: f.w, h: f.h };
+                match f.kind {
+                    FieldKind::Text => render::Field::Text(TextField {
+                        text,
+                        font: if f.bold { &fonts.bold } else { &fonts.regular },
+                        zone,
+                        align: f.align.into(),
+                        fit: f.fit.into(),
+                        max_pt: f.max_pt,
+                        wrap: f.wrap,
+                    }),
+                    FieldKind::Qr => render::Field::Qr { text, zone, padding: f.padding },
+                }
             })
             .collect();
         let pictures: Vec<_> = self.template.pictures.iter().map(config::Picture::core).collect();
@@ -109,6 +115,19 @@ fn bitmap_image(b: &Bitmap) -> ColorImage {
 
 pub fn texture(ctx: &egui::Context, name: &str, b: &Bitmap) -> TextureHandle {
     ctx.load_texture(name, bitmap_image(b), TextureOptions::LINEAR)
+}
+
+/// Restore QR pixels over any live pictures painted on top of the cached label.
+pub fn paint_qr_layer(painter: &egui::Painter, label: egui::Rect, texture: &TextureHandle, rendered: &Rendered) {
+    let w = rendered.preview.width_px as f32;
+    let h = rendered.preview.height_px as f32;
+    for bounds in &rendered.qr_bounds {
+        let min = Pos2::new(bounds.x as f32 / w, bounds.y as f32 / h);
+        let max = Pos2::new((bounds.x + bounds.side) as f32 / w, (bounds.y + bounds.side) as f32 / h);
+        let uv = egui::Rect::from_min_max(min, max);
+        let rect = egui::Rect::from_min_max(label.lerp_inside(min.to_vec2()), label.lerp_inside(max.to_vec2()));
+        painter.image(texture.id(), rect, uv, Color32::WHITE);
+    }
 }
 
 /// The live bitmap of a picture still being placed, drawn over the cached label render.
@@ -170,10 +189,14 @@ struct Run {
 
 impl Run {
     /// One job with these labels of the series, back to back.
-    fn job(&self, labels: Range<u64>, fonts: &Fonts) -> Result<Vec<u8>, String> {
+    fn job(&self, labels: Range<u64>, fonts: &Fonts, t: &Tr) -> Result<Vec<u8>, String> {
         let mut job = Vec::new();
         for i in labels {
             let r = self.key.render_with(&self.series.texts(&self.key.texts, i), fonts);
+            if let Some(&(field, error)) = r.qr_errors.first() {
+                let name = &self.key.template.fields[field].name;
+                return Err(format!("#{} · {name}: {}", i + 1, t.qr_error(error)));
+            }
             job.extend((Tspl { dpi: DPI }).encode(&r.label, 1).map_err(|e| e.to_string())?);
         }
         Ok(job)
@@ -374,7 +397,7 @@ impl App {
         let (Some(key), Some(series)) = (self.base_key(), self.series.clone()) else { return };
         let (batch, first) = Batch::start(series.count);
         let mut run = Run { batch, key, series };
-        match run.job(first, &self.fonts) {
+        match run.job(first, &self.fonts, tr(self.lang())) {
             Ok(job) => self.printers.print(job),
             Err(e) => run.batch.fail(e),
         }
@@ -382,9 +405,10 @@ impl App {
     }
 
     fn advance_run(&mut self) {
+        let t = tr(self.lang());
         let Some(run) = &mut self.run else { return };
         let Some(labels) = run.batch.tick(&self.snapshot) else { return };
-        match run.job(labels, &self.fonts) {
+        match run.job(labels, &self.fonts, t) {
             Ok(job) => self.printers.print(job),
             Err(e) => run.batch.fail(e),
         }
@@ -514,7 +538,13 @@ impl App {
         }
         ui.add_space(8.0);
 
-        let sizes_pt = self.rendered.as_ref().map(|(_, r, _)| r.sizes_pt.clone()).unwrap_or_default();
+        let (sizes_pt, qr_errors) = self
+            .rendered
+            .as_ref()
+            .map(|(_, r, _)| (r.sizes_pt.as_slice(), r.qr_errors.as_slice()))
+            .unwrap_or_default();
+        let valid_preview = self.rendered.is_some() && qr_errors.is_empty();
+        let mut has_ink = !template.pictures.is_empty();
         for (i, field) in template.fields.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(&field.name);
@@ -533,6 +563,13 @@ impl App {
                 .entry(field.name.clone())
                 .or_default();
             ui.add(TextEdit::singleline(text).hint_text(field.sample.clone()).desired_width(f32::INFINITY));
+            has_ink |= match field.kind {
+                FieldKind::Text => !text.trim().is_empty(),
+                FieldKind::Qr => !text.is_empty(),
+            };
+            if let Some(&(_, error)) = qr_errors.iter().find(|(index, _)| *index == i) {
+                ui.colored_label(ui.visuals().error_fg_color, t.qr_error(error));
+            }
         }
         let names = ranges::names(self.texts(&template).iter().map(String::as_str));
         if !names.is_empty() {
@@ -540,13 +577,12 @@ impl App {
         }
         ui.add_space(12.0);
 
-        let has_ink = !template.pictures.is_empty() || self.texts(&template).iter().any(|s| !s.trim().is_empty());
         // Unbaked pictures are not in the render yet: nothing should print until they are baked.
         let unbaked = template.pictures.iter().any(|p| p.pending.is_some());
         let running = self.running();
         let count = self.series.as_ref().map(|s| s.count);
         let ready = self.snapshot.health == Some(Health::Ready) && !self.snapshot.busy_printing && !running;
-        let can_print = ready && has_ink && !unbaked && self.rendered.is_some() && count.is_some();
+        let can_print = ready && has_ink && !unbaked && valid_preview && count.is_some();
         let current = self.run.as_ref().and_then(|r| r.batch.current().map(|labels| (labels, r.batch.total)));
         let label = match (current, count) {
             (Some((labels, total)), _) if labels.end - labels.start > 1 => {
@@ -575,10 +611,15 @@ impl App {
             ui.add_enabled(can_print, print.min_size(Vec2::new(ui.available_width(), 40.0))).clicked()
         };
         if clicked {
-            match count {
+            // The form may have changed since the logic pass that rendered the preview.
+            self.follow_series();
+            self.rerender_if_needed(ui.ctx());
+        }
+        if clicked && self.rendered.as_ref().is_some_and(|(_, r, _)| r.qr_errors.is_empty()) {
+            match self.series.as_ref().map(|s| s.count) {
                 Some(n) if n > CONFIRM_ABOVE => self.confirm = Some(n),
                 Some(n) if n > 1 => self.start_run(),
-                _ => {
+                Some(_) => {
                     self.run = None;
                     if let Some((_, r, _)) = &self.rendered
                         && let Ok(job) = (Tspl { dpi: DPI }).encode(&r.label, 1)
@@ -586,6 +627,7 @@ impl App {
                         self.printers.print(job);
                     }
                 }
+                None => {}
             }
         }
         let error = ui.visuals().error_fg_color;
@@ -727,6 +769,9 @@ impl App {
                 let uv = egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
                 ui.painter().image(tex, rect, uv, Color32::WHITE);
                 live.insert(key);
+            }
+            if !live.is_empty() {
+                paint_qr_layer(ui.painter(), label, texture, r);
             }
             self.picture_textures.retain(|k, _| live.contains(k));
         }
@@ -934,5 +979,50 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.state.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qr_series_renders_each_value_and_rejects_a_label_that_does_not_fit() {
+        let template = config::parse_templates(
+            r#"
+[[template]]
+name = "Series"
+[[template.field]]
+name = "Code"
+type = "qr"
+"#,
+        )
+        .unwrap()
+        .remove(0);
+        let key = RenderKey {
+            size: Size { name: None, width_mm: 20.0, height_mm: 20.0, gap_mm: 2.0 },
+            template,
+            orientation: Orientation::Portrait,
+            texts: vec!["abcdefghijklm{n}".into()],
+        };
+        let ranges = BTreeMap::from([(
+            "n".into(),
+            ranges::Range { start: "9".into(), stop: "10".into(), step: "1".into() },
+        )]);
+        let series = Series::new(&["n".into()], &ranges, Mode::Product).unwrap();
+        let (batch, _) = Batch::start(series.count);
+        let mut run = Run { batch, key, series };
+        let fonts = Fonts::embedded();
+        let t = tr(Lang::En);
+        let first = run.job(0..1, &fonts, t).unwrap();
+        let second = run.job(1..2, &fonts, t).unwrap();
+        assert_ne!(first, second, "substituted values must produce different print bitmaps");
+
+        // Only the first payload fits a narrow label because the extra digit
+        // on the second one requires a larger QR version.
+        run.key.size.width_mm = 11.5;
+        assert!(run.job(0..1, &fonts, t).is_ok());
+        let error = run.job(0..2, &fonts, t).unwrap_err();
+        assert!(error.starts_with("#2 · Code:"), "{error}");
     }
 }

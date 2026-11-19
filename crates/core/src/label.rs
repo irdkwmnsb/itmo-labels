@@ -84,6 +84,11 @@ impl Bitmap {
         self.data[y as usize * row_bytes + x as usize / 8] |= 0x80 >> (x % 8);
     }
 
+    pub(crate) fn clear(&mut self, x: u32, y: u32) {
+        let row_bytes = self.row_bytes();
+        self.data[y as usize * row_bytes + x as usize / 8] &= !(0x80 >> (x % 8));
+    }
+
     /// Rotated 90° clockwise: the top row becomes the right column.
     pub fn rotated_cw(&self) -> Self {
         let mut out = Self::blank(self.x_mm, self.y_mm, self.height_px, self.width_px);

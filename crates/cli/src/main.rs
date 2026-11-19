@@ -14,7 +14,7 @@ use std::{env, fs, process::ExitCode, time::Duration};
 use itmo_labels_core::{
     fonts,
     label::{Bitmap, Element, Font, Label, Rect, Rotation, Text},
-    render::{self, Align, Fit, LabelSpec, Orientation, TextField, Zone},
+    render::{self, Align, Field, Fit, LabelSpec, Orientation, TextField, Zone},
     transport::{self, Transport},
     tspl::{Status, Tspl},
 };
@@ -155,7 +155,7 @@ fn run(args: &[String]) -> Result<()> {
                 other => return Err(format!("unknown orientation {other}").into()),
             };
             let font = fonts::regular();
-            let fields = [TextField {
+            let fields = [Field::Text(TextField {
                 text: arg(3, "text")?,
                 font: &font,
                 zone: Zone::FULL,
@@ -163,7 +163,7 @@ fn run(args: &[String]) -> Result<()> {
                 fit: Fit::Ink,
                 max_pt: None,
                 wrap: false,
-            }];
+            })];
             let r = render::render(&LabelSpec {
                 width_mm: w.parse()?,
                 height_mm: h.parse()?,
